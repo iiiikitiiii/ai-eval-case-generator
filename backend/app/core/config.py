@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # 这是启动时的兜底默认值——运行时实际用哪个后端由 app_settings 表的
     # llm_provider 行决定（Prompt 后台页面可切换 minimax/kimi），数据库里
     # 没有这一行时才落回这个值。见 app/services/settings_service.py。
-    llm_provider: str = "minimax"  # "minimax" | "kimi" | "anthropic"
+    llm_provider: str = "minimax"  # "minimax" | "kimi" | "anthropic" | "openai"
     # MiniMax-M3 spends part of this budget on `thinking` before it ever gets
     # to the tool call — 16k was observed to truncate mid-response on Agent F
     # (the heaviest agent: full case context + several cutpoints). MiniMax's
@@ -48,6 +48,10 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"
+
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.wow3.top/v1"
+    openai_model: str = "gpt-5.6-sol"
 
     minimax_api_key: str = ""
     minimax_base_url: str = "https://api.minimaxi.com/v1"

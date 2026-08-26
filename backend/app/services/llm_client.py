@@ -3,7 +3,7 @@ schema-conformant dict back from whichever LLM provider is active. Which
 one that is comes from `app.services.settings_service.get_llm_provider()`
 (a DB row callers fetch and pass in as `provider`, since it's switchable at
 runtime from the Prompt 后台 page — see that module's docstring), falling
-back to `settings.llm_provider` when the caller doesn't pass one. Three
+back to `settings.llm_provider` when the caller doesn't pass one. Four
 backends:
 
 - **minimax** (default): OpenAI-compatible `/chat/completions`, called
@@ -24,6 +24,9 @@ backends:
   supports `tool_choice="required"`, so there's no system-prompt-hint /
   content-fallback dance needed here; the model is forced to call the tool.
 - **anthropic**: Claude Messages API with forced tool-use, kept as an
+  alternate backend behind the same interface — no agent code needs to
+  know which provider is active.
+- **openai**: OpenAI Chat Completions API with forced tool-use, kept as an
   alternate backend behind the same interface — no agent code needs to
   know which provider is active.
 
@@ -91,6 +94,8 @@ async def run_structured(
     provider = provider or settings.llm_provider
     if provider == "anthropic":
         return await _run_anthropic(system_prompt, schema, user_text, images, model, max_tokens, on_usage)
+    if provider == "openai":
+        return await _run_openai(system_prompt, schema, user_text, images, model, max_tokens, on_progress, on_usage)
     if provider == "kimi":
         return await _run_kimi(system_prompt, schema, user_text, images, model, max_tokens, on_progress, on_usage)
     return await _run_minimax(system_prompt, schema, user_text, images, model, max_tokens, on_progress, on_usage)
@@ -390,3 +395,73 @@ async def _run_anthropic(
             return block.input  # type: ignore[return-value]
 
     raise LLMStructuredError("模型没有返回结构化结果（未命中 tool_use）")
+
+
+async def _run_openai(
+    system_prompt: str,
+    schema: dict,
+    user_text: str,
+    images: list[tuple[bytes, str]] | None,
+    model: str | None,
+    max_tokens: int,
+    on_progress: Callable[[str], None] | None,
+    on_usage: Callable[[dict], None] | None,
+) -> dict:
+    content: list[dict] = []
+    for raw, content_type in images or []:
+        b64 = base64.b64encode(raw).decode("ascii")
+        content.append({"type": "image_url", "image_url": {"url": f"data:{content_type};base64,{b64}"}})
+    content.append({"type": "text", "text": user_text})
+
+    payload = {
+        "model": model or settings.openai_model,
+        "messages": [
+            {"role": "system", "content": system_prompt + _FORCE_TOOL_HINT},
+            {"role": "user", "content": content},
+        ],
+        "max_completion_tokens": max_tokens,
+        "tool_choice": {"type": "function", "function": {"name": _TOOL_NAME}},
+        "parallel_tool_calls": False,
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": _TOOL_NAME, "description": "输出结构化结果", "parameters": schema},
+            }
+        ],
+    }
+
+    message = await _stream_openai_compatible(
+        f"{settings.openai_base_url.rstrip('/')}/chat/completions",
+        {"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+        payload,
+        on_progress,
+        "OpenAI ",
+    )
+    # 无论最终解析成不成功都要报——截断/解析失败的调用照样花了 token，
+    # 看板要看到真实花销，不是只统计"成功"的那部分。
+    _report_usage(on_usage, "openai", model or settings.openai_model, message["usage"])
+
+    if message["finish_reason"] == "length":
+        raise LLMStructuredError(
+            f"响应在完成前被截断（finish_reason=length，max_completion_tokens={max_tokens}）——"
+            "调大 max_tokens 或简化这次调用的上下文再试"
+        )
+
+    for call in message["tool_calls"]:
+        if call["function"]["name"] == _TOOL_NAME:
+            args = call["function"]["arguments"] or ""
+            try:
+                return json.loads(args)
+            except json.JSONDecodeError as exc:
+                # 之前这里只报 json 库自己的报错，看不出模型到底吐了什么——
+                # 调试一次真实失败花了大量来回。带上原始内容的前后片段，
+                # 下次直接在运行记录里就能看出是格式错误还是内容本身有问题。
+                raise LLMStructuredError(
+                    f"emit_result 的参数不是合法 JSON：{exc}\n"
+                    f"原始内容开头 300 字：{args[:300]!r}\n"
+                    f"原始内容结尾 300 字：{args[-300:]!r}"
+                ) from exc
+
+    raise LLMStructuredError(
+        f"OpenAI 没有调用指定函数 {_TOOL_NAME}（finish_reason={message['finish_reason']}）"
+    )
