@@ -32,8 +32,10 @@ backend/.pytest_cache/
 .DS_Store
 .vscode/
 .idea/
+.venv/
 
 # generated test/build caches
 .pytest_cache/
 .coverage
 htmlcov/
+环境变量说明.md
