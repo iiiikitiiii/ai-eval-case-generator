@@ -1,0 +1,30 @@
+# 生产镜像：构建阶段用 Node 跑 vite build 产出静态文件，运行阶段只是
+# nginx 发布这些静态文件——不是 npm run dev 起一个开发服务器（那个连
+# 热重载、sourcemap 之类开发期才需要的东西都在，也没有反代、没有生产
+# 级别的静态资源缓存策略）。
+
+# ---- 构建阶段 ----
+FROM node:20-alpine AS builder
+
+WORKDIR /srv
+
+COPY package.json package-lock.json* .
+RUN npm ci
+
+COPY . .
+
+# VITE_API_BASE_URL 是构建时烤进产物的（Vite 的环境变量都是构建期展开，
+# 不是运行时读取）——用相对路径 /api，配合 nginx.conf 里的反代，同一个
+# 域名/端口下前端和后端都能访问，不用在部署时给后端单独开一个可从外部
+# 直连的端口，也不用处理跨域。
+ARG VITE_API_BASE_URL=/api
+ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
+RUN npm run build
+
+# ---- 运行阶段 ----
+FROM nginx:1.27-alpine
+
+COPY --from=builder /srv/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80

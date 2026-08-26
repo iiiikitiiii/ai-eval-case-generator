@@ -1,0 +1,77 @@
+name: case-pipeline-hub
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: caseflow
+      POSTGRES_PASSWORD: caseflow
+      POSTGRES_DB: caseflow
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U caseflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: caseflow
+      MINIO_ROOT_PASSWORD: caseflow-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes: ["minio-data:/data"]
+
+  backend:
+    build: ../backend
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://caseflow:caseflow@postgres:5432/caseflow
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+    volumes: ["../backend:/srv"]
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  worker:
+    build: ../backend
+    env_file: [.env]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://caseflow:caseflow@postgres:5432/caseflow
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: minio:9000
+    volumes: ["../backend:/srv"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    command: ["arq", "app.workers.worker.WorkerSettings"]
+
+  frontend:
+    build: ../frontend
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    volumes: ["../frontend:/srv", "/srv/node_modules"]
+    ports: ["5173:5173"]
+    command: ["npm", "run", "dev", "--", "--host"]
+
+volumes:
+  pgdata:
+  minio-data:

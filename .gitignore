@@ -1,0 +1,39 @@
+# backend
+backend/.venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# backend caches
+backend/.pytest_cache/
+
+# 密钥/环境变量文件——backend/.env 是本地非容器开发用的真实密钥文件，
+# 之前完全没被排除，是这次打包部署时顺手发现并修的一个真实缺口（这个
+# 仓库到写这行为止还没 git init 过，还没真的泄露过，但迟早会）。用一条
+# 通配规则覆盖所有 .env 变体（.env、.env.prod、以后可能加的
+# .env.staging 之类），只保留 .example 结尾的模板文件可以被提交。
+**/.env
+**/.env.*
+!**/.env*.example
+
+# local native (non-docker) run artifacts: minio data dir, service logs
+.local/
+
+# 离线部署打包产物——300MB+ 的镜像 tar，是按需生成的交付物，不是源码，
+# 不该进 git 历史。
+/dist/
+
+# editors / os
+.DS_Store
+.vscode/
+.idea/
+
+# generated test/build caches
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,13 @@
+# 没有这个文件时 `docker build` 会把 .env（真实密钥）和 .venv（148MB）都
+# 塞进构建上下文——Dockerfile 里的 COPY . . 会把 .env 直接烤进镜像层，
+# 镜像一旦被 push 到仓库或者分享给别人，密钥就泄露了。这是这次补生产
+# 部署时顺手发现并修的一个真实安全缺口，不是新功能的一部分。
+.venv
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+.pytest_cache
+tests
+.git

@@ -1,0 +1,84 @@
+/* 设计令牌：与「用例工坊」「生成侧 Pipeline Demo」两份原型保持同一套语义色，
+   三个页面（病例工坊 / Prompt 维护后台 / 用例看板）共用，不再各建一套。 */
+:root {
+  --bg: #f3f1ec;
+  --surface: #ffffff;
+  --card: #fbfbfa;
+  --ink: #20232a;
+  --sub: #5b5f6a;
+  --muted: #93969e;
+  --line: #dedcd4;
+  --line-soft: #eae8e1;
+
+  --navy: #1f3864;   /* 结构 / 抽取（客观事实） */
+  --navy-l: #eaf0fa;
+  --navy-b: #b8cbe8;
+
+  --red: #a32d2d;    /* 冲突 / 待处理 */
+  --red-l: #fbeaea;
+  --red-b: #e3b3b3;
+
+  --mock: #8a5a00;   /* 推测 / 编造（需人工背书） */
+  --mock-l: #fcf3e3;
+  --mock-b: #e8c88c;
+
+  --green: #2f6b3a;  /* 已确认 / 通过 */
+  --green-l: #eaf5ec;
+  --green-b: #bedcc4;
+
+  --ex: #1d6f8c;     /* 示例 / 参考 */
+  --ex-l: #eaf4f8;
+  --ex-b: #b9dce6;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #15171b;
+    --surface: #1b1e24;
+    --card: #20232b;
+    --ink: #ecedef;
+    --sub: #a8acb6;
+    --muted: #6b6f79;
+    --line: #33363e;
+    --line-soft: #282b33;
+
+    --navy: #6c93d1;
+    --navy-l: #16223a;
+    --navy-b: #2c4874;
+
+    --red: #dd8783;
+    --red-l: #3a1e1e;
+    --red-b: #6b3232;
+
+    --mock: #ddb158;
+    --mock-l: #332810;
+    --mock-b: #6b5220;
+
+    --green: #7fc98b;
+    --green-l: #16301c;
+    --green-b: #2e5636;
+
+    --ex: #72c2e0;
+    --ex-l: #122e38;
+    --ex-b: #295064;
+  }
+}
+
+@keyframes progress-stripe {
+  from { background-position: 0 0; }
+  to { background-position: 28px 0; }
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.6;
+}
