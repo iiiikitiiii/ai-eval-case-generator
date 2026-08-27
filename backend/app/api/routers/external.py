@@ -15,6 +15,26 @@ from app.schemas.external import NextTurnIn, NextTurnOut
 router = APIRouter(prefix="/external", tags=["external"])
 
 
+"""
+调用格式：
+1. POST /auth/login
+   Body: {"email": "runner@example.com", "password": "..."}
+   从响应的 access_token 字段取得 JWT。
+2. POST /external/queries/{query_id}/next-turn
+   Headers: Authorization: Bearer <access_token>
+            Content-Type: application/json
+   首轮 Body: {"latest_response": null}
+   后续 Body: {"latest_response": "被测系统对上一轮的实际回答"}
+3. 正式实现后的 200 响应格式：
+   {
+     "conversation_id": "<uuid>", "round": 1,
+     "messages": ["本轮应发送的消息"], "images": [1, 2],
+     "done": false, "stop_reason": null
+   }
+当前仅开放并鉴权该契约，因此合法请求返回 501，避免调用方把占位响应
+误认为已经生成并保存了一轮对话。
+"""
+
 @router.post(
     "/queries/{query_id}/next-turn",
     response_model=NextTurnOut,

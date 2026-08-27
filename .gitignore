@@ -33,9 +33,12 @@ backend/.pytest_cache/
 .vscode/
 .idea/
 .venv/
+.mypy_cache/
+AGENTS.md
 
 # generated test/build caches
 .pytest_cache/
 .coverage
 htmlcov/
+
 环境变量说明.md

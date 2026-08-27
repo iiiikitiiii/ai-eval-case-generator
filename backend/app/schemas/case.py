@@ -50,8 +50,8 @@ class AdvanceStepIn(BaseModel):
 
 
 class RunAgentFIn(BaseModel):
-    # 不传或传空 = 用全部启用中的画像/场景（跟以前的行为一致）；传了就只
-    # 用选中的那部分，省 token 也省人工筛选的功夫。
+    # 不传或传空 = 用全部启用中的画像/场景（跟以前的行为一致）；
+    # 传了就只用选中的那部分，省 token 也省人工筛选的功夫。
     persona_codes: list[str] | None = None
     scenario_codes: list[str] | None = None
 
