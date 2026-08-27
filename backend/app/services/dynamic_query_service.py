@@ -24,7 +24,9 @@ from app.services.llm_client import run_structured
 from app.services.settings_service import get_llm_provider
 
 MAX_DYNAMIC_ROUNDS = 4
-DYNAMIC_QUERY_TIMEOUT_SECONDS = 120
+# Match the OpenAI-compatible client's network deadline so long reasoning does
+# not get cancelled by the conversation layer while the provider is responsive.
+DYNAMIC_QUERY_TIMEOUT_SECONDS = 420
 DYNAMIC_QUERY_MAX_TOKENS = 4096
 
 _DYNAMIC_QUERY_SCHEMA = {
