@@ -1,5 +1,5 @@
 /* 设计令牌：与「用例工坊」「生成侧 Pipeline Demo」两份原型保持同一套语义色，
-   三个页面（病例工坊 / Prompt 维护后台 / 用例看板）共用，不再各建一套。 */
+   四个页面（病例工坊 / Prompt 维护后台 / 用例看板 / 动态生成）共用，不再各建一套。 */
 :root {
   --bg: #f3f1ec;
   --surface: #ffffff;
@@ -70,6 +70,23 @@
 @keyframes progress-stripe {
   from { background-position: 0 0; }
   to { background-position: 28px 0; }
+}
+
+/* Dynamic generation follows a 3:2 desktop split: the full test-case card
+   needs more reading width than the response composer. Below tablet width the
+   panels become separate rows so neither column is squeezed. */
+.dynamic-content-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  align-items: stretch;
+  gap: 18px;
+  margin-top: 18px;
+}
+
+@media (max-width: 960px) {
+  .dynamic-content-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 * { box-sizing: border-box; }

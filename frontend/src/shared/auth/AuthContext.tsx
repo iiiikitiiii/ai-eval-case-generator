@@ -57,9 +57,11 @@ export function useAuth(): AuthState {
   return ctx;
 }
 
-/** 三个页面各自的最小可访问角色，供 AppShell 和路由守卫复用。 */
-export const PAGE_ROLES: Record<"workshop" | "prompts" | "board", Role[]> = {
+/** 四个页面各自的最小可访问角色，供 AppShell 和路由守卫复用。 */
+export const PAGE_ROLES: Record<"workshop" | "prompts" | "board" | "dynamic", Role[]> = {
   workshop: ["reviewer", "admin"],
   prompts: ["engineer", "admin"],
   board: ["manager", "reviewer", "engineer", "admin"], // 看板对所有角色只读可见
+  // 动态生成入口在 Stage 2-1 与看板保持相同可见范围。
+  dynamic: ["manager", "reviewer", "engineer", "admin"],
 };

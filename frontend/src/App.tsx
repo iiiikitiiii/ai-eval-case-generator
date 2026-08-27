@@ -6,6 +6,7 @@ import { AppShell } from "./shared/layout/AppShell";
 import { WorkshopPage } from "./routes/workshop/WorkshopPage";
 import { PromptsPage } from "./routes/prompts/PromptsPage";
 import { BoardPage } from "./routes/board/BoardPage";
+import { DynamicGenerationPage } from "./routes/dynamic/DynamicGenerationPage";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { user, loading } = useAuth();
@@ -65,6 +66,14 @@ export function App() {
               element={
                 <RequireRole page="board">
                   <BoardPage />
+                </RequireRole>
+              }
+            />
+            <Route
+              path="/dynamic/*"
+              element={
+                <RequireRole page="dynamic">
+                  <DynamicGenerationPage />
                 </RequireRole>
               }
             />

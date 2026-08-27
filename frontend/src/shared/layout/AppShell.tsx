@@ -8,6 +8,9 @@ const NAV = [
   { to: "/workshop", label: "病例工坊", page: "workshop" as const },
   { to: "/prompts", label: "Prompt 维护后台", page: "prompts" as const },
   { to: "/board", label: "用例看板", page: "board" as const },
+  // Stage 2-1 only exposes the dedicated module entry; workflow controls are
+  // added inside this route in later stages without changing the global nav.
+  { to: "/dynamic", label: "动态生成", page: "dynamic" as const },
 ];
 
 const ROLE_LABEL: Record<string, string> = {
