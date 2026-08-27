@@ -17,4 +17,19 @@ def test_openapi_schema_builds():
     assert resp.status_code == 200
     paths = resp.json()["paths"]
     assert "/auth/login" in paths
+    # The external contract must remain discoverable even before its dynamic
+    # conversation implementation is connected.
+    assert "/external/queries/{query_id}/next-turn" in paths
     assert "/health" in paths
+
+
+def test_external_next_turn_requires_bearer_token():
+    """External callers cannot reach the contract without a valid JWT."""
+
+    client = TestClient(app)
+    resp = client.post(
+        "/external/queries/00000000-0000-0000-0000-000000000001/next-turn",
+        json={"latest_response": None},
+    )
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == "未登录"

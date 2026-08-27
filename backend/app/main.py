@@ -5,7 +5,9 @@ from arq.connections import RedisSettings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.routers import agents, auth, board, cases, health, settings as settings_router
+# External integrations have their own route namespace while sharing the
+# existing account/password JWT implementation with the web application.
+from app.api.routers import agents, auth, board, cases, external, health, settings as settings_router
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -38,6 +40,7 @@ app.include_router(cases.router)
 app.include_router(agents.router)
 app.include_router(board.router)
 app.include_router(settings_router.router)
+app.include_router(external.router)
 
 # Phase 3: regression-suite router still open (golden-case runs, publish gate)
 # Phase 5: audit log usage, compliance-tightened storage (async queue is done)
