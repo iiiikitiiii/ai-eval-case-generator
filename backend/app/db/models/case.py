@@ -12,13 +12,16 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Index,
     ForeignKey,
     String,
     Text,
     Boolean,
     DateTime,
     Integer,
+    UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -269,6 +272,92 @@ class QueryVariant(Base):
     @property
     def persona_name(self) -> str | None:
         return self.persona.name if self.persona else None
+
+
+ACTIVE_DYNAMIC_CONVERSATION_STATUSES = (
+    "awaiting_response",
+    "generating",
+    "generation_failed",
+)
+
+
+class DynamicConversation(Base):
+    """Persist one account's dynamic run independently of regenerated queries.
+
+    Query and variant UUIDs intentionally are not foreign keys because Agent F
+    replaces those source rows on rerun. The context snapshot keeps completed
+    and in-progress conversation history auditable after such a replacement.
+    """
+
+    __tablename__ = "dynamic_conversations"
+    __table_args__ = (
+        # Callers do not send a conversation id, so the database must prevent
+        # concurrent active histories from sharing the actor/query lookup key.
+        Index(
+            "uq_dynamic_conversations_active_actor_query",
+            "started_by",
+            "query_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('awaiting_response', 'generating', 'generation_failed')"
+            ),
+        ),
+        Index("ix_dynamic_conversations_query_id", "query_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    query_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    variant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    started_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(24), default="awaiting_response")
+    current_round: Mapped[int] = mapped_column(Integer, default=1)
+    context_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)
+    stop_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    turns: Mapped[list["DynamicConversationTurn"]] = relationship(
+        back_populates="conversation",
+        cascade="all, delete-orphan",
+        order_by="DynamicConversationTurn.round",
+    )
+
+
+class DynamicConversationTurn(Base):
+    """Store one generated user turn and the tested product's answer."""
+
+    __tablename__ = "dynamic_conversation_turns"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "round",
+            name="uq_dynamic_conversation_turns_conversation_round",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dynamic_conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    round: Mapped[int] = mapped_column(Integer, nullable=False)
+    user_messages: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+    image_seqs: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
+    tested_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(String(8))  # seed | llm
+    token_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    conversation: Mapped[DynamicConversation] = relationship(back_populates="turns")
 
 
 class PipelineRun(Base):

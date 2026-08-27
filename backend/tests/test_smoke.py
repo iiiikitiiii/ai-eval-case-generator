@@ -29,7 +29,10 @@ def test_external_next_turn_requires_bearer_token():
     client = TestClient(app)
     resp = client.post(
         "/external/queries/00000000-0000-0000-0000-000000000001/next-turn",
-        json={"latest_response": None},
+        json={
+            "variant_id": "00000000-0000-0000-0000-000000000002",
+            "latest_response": None,
+        },
     )
     assert resp.status_code == 401
     assert resp.json()["detail"] == "未登录"

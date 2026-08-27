@@ -1,22 +1,18 @@
-"""Public request/response contracts for authenticated external integrations."""
+"""Public request and response contracts for authenticated integrations."""
 import uuid
 
 from pydantic import BaseModel, Field
 
 
 class NextTurnIn(BaseModel):
-    """The caller only sends the tested product's latest answer.
+    """Select the persona variant and optionally answer the current turn."""
 
-    Omitting ``latest_response`` starts a conversation once the server-side
-    conversation service is implemented; later calls must provide the answer
-    to the most recently generated user turn.
-    """
-
+    variant_id: uuid.UUID
     latest_response: str | None = Field(default=None, max_length=100_000)
 
 
 class NextTurnOut(BaseModel):
-    """Stable response shape reserved for the dynamic next-turn service."""
+    """Return the next user messages or the completed conversation state."""
 
     conversation_id: uuid.UUID
     round: int

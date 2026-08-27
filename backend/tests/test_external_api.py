@@ -7,10 +7,11 @@ from app.core.security import hash_password
 from app.db.models.user import User
 from app.db.session import get_db
 from app.main import app
+from app.services import dynamic_query_service
 
 
-def test_login_token_reaches_external_next_turn_contract():
-    """A normal active account can exchange credentials and pass JWT auth."""
+def test_login_token_reaches_external_next_turn_contract(monkeypatch):
+    """A normal account reaches the thin adapter with its issued JWT."""
 
     password = "external-test-password"
     user = User(
@@ -41,6 +42,25 @@ def test_login_token_reaches_external_next_turn_contract():
     def override_get_db():
         yield SingleUserDb()
 
+    conversation_id = uuid.uuid4()
+
+    async def fake_advance_next_turn(**kwargs):
+        # The adapter must pass authenticated identity and request fields to
+        # the reusable service without implementing conversation logic itself.
+        assert kwargs["actor_id"] == user.id
+        assert kwargs["latest_response"] is None
+        return dynamic_query_service.NextTurnResult(
+            conversation_id=conversation_id,
+            round=1,
+            messages=["种子首轮"],
+            images=[1],
+            done=False,
+        )
+
+    monkeypatch.setattr(
+        "app.services.dynamic_query_service.advance_next_turn",
+        fake_advance_next_turn,
+    )
     app.dependency_overrides[get_db] = override_get_db
     try:
         client = TestClient(app)
@@ -54,11 +74,38 @@ def test_login_token_reaches_external_next_turn_contract():
         response = client.post(
             "/external/queries/00000000-0000-0000-0000-000000000001/next-turn",
             headers={"Authorization": f"Bearer {token}"},
-            json={"latest_response": None},
+            json={
+                "variant_id": "00000000-0000-0000-0000-000000000002",
+                "latest_response": None,
+            },
         )
-        # Reaching 501 instead of 401 proves the complete credential-to-JWT
-        # authentication path succeeded; turn generation is the next phase.
-        assert response.status_code == 501, response.text
-        assert response.json()["detail"] == "动态多轮会话服务尚未实现；API 入口和 JWT 鉴权已就绪"
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "conversation_id": str(conversation_id),
+            "round": 1,
+            "messages": ["种子首轮"],
+            "images": [1],
+            "done": False,
+            "stop_reason": None,
+        }
+
+        async def fake_conflict(**kwargs):
+            raise dynamic_query_service.DynamicQueryConflict("会话状态冲突")
+
+        monkeypatch.setattr(
+            dynamic_query_service,
+            "advance_next_turn",
+            fake_conflict,
+        )
+        conflict = client.post(
+            "/external/queries/00000000-0000-0000-0000-000000000001/next-turn",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "variant_id": "00000000-0000-0000-0000-000000000002",
+                "latest_response": "测试答复",
+            },
+        )
+        assert conflict.status_code == 409
+        assert conflict.json()["detail"] == "会话状态冲突"
     finally:
         app.dependency_overrides.pop(get_db, None)
