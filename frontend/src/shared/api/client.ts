@@ -24,7 +24,9 @@ export function getAuthToken() {
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
-  headers.set("Content-Type", "application/json");
+  // FormData must keep the browser-generated multipart boundary. JSON calls
+  // continue to receive the same explicit content type as before.
+  if (!(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
   if (authToken) headers.set("Authorization", `Bearer ${authToken}`);
 
   const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
@@ -40,6 +42,10 @@ export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
+  // Shared multipart entry point keeps authentication and ApiError behavior
+  // identical to normal JSON requests without exposing tokens to page code.
+  postForm: <T>(path: string, body: FormData) =>
+    request<T>(path, { method: "POST", body }),
   put: <T>(path: string, body?: unknown) =>
     request<T>(path, { method: "PUT", body: body ? JSON.stringify(body) : undefined }),
   patch: <T>(path: string, body?: unknown) =>

@@ -23,23 +23,11 @@ export function getCase(caseId: string) {
   return api.get<CaseDetail>(`/cases/${caseId}`);
 }
 
-/** Multipart upload can't go through the JSON `api` client — no
- * Content-Type header here on purpose, the browser sets the multipart
- * boundary itself. */
+/** Reuse the shared multipart client so uploads follow the same auth/error path. */
 export async function uploadDocuments(caseId: string, files: File[]): Promise<CaseDetail> {
   const form = new FormData();
   for (const f of files) form.append("files", f);
-
-  const headers = new Headers();
-  const token = getAuthToken();
-  if (token) headers.set("Authorization", `Bearer ${token}`);
-
-  const res = await fetch(`${BASE_URL}/cases/${caseId}/documents`, { method: "POST", body: form, headers });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new ApiError(res.status, body.detail ?? `上传失败（${res.status}）`);
-  }
-  return res.json();
+  return api.postForm<CaseDetail>(`/cases/${caseId}/documents`, form);
 }
 
 // 五个 run-X 现在都是"排队即返回"（202 + PipelineRunOut，status=queued），

@@ -17,9 +17,10 @@ def test_openapi_schema_builds():
     assert resp.status_code == 200
     paths = resp.json()["paths"]
     assert "/auth/login" in paths
-    # The external contract must remain discoverable even before its dynamic
-    # conversation implementation is connected.
+    # Both web and external callers expose the same dynamic Query contract
+    # under their appropriate route namespace.
     assert "/external/queries/{query_id}/next-turn" in paths
+    assert "/cases/{case_id}/queries/{query_id}/next-turn" in paths
     assert "/health" in paths
 
 

@@ -352,6 +352,12 @@ class DynamicConversationTurn(Base):
     user_messages: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     image_seqs: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     tested_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Store only durable object references and integrity metadata in Postgres;
+    # the potentially large reply screenshots remain in the existing MinIO.
+    tested_response_images: Mapped[list[dict]] = mapped_column(JSONB, default=list)
+    # Preserve the model's transcription of reply screenshots so later turns
+    # retain their textual meaning even though prior images are not replayed.
+    tested_response_raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(8))  # seed | llm
     token_usage: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

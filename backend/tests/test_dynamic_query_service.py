@@ -20,6 +20,45 @@ from app.services import dynamic_query_service
 from app.services.llm_client import LLMStructuredError
 
 
+# The service performs lightweight signature validation rather than decoding;
+# these compact fixtures are enough to exercise its supported-format boundary.
+PNG_REPLY = b"\x89PNG\r\n\x1a\nreply-image"
+PNG_REPLY_2 = b"\x89PNG\r\n\x1a\nsecond-reply-image"
+
+
+def _reply_image(
+    data: bytes = PNG_REPLY,
+    content_type: str = "image/png",
+) -> dynamic_query_service.ResponseImageInput:
+    """Build transport-neutral image input without involving FastAPI uploads."""
+
+    return dynamic_query_service.ResponseImageInput(data=data, content_type=content_type)
+
+
+def _install_memory_storage(monkeypatch):
+    """Replace MinIO calls with an ordered in-memory store for service tests."""
+
+    objects: dict[str, tuple[bytes, str]] = {}
+    writes: list[str] = []
+    deletes: list[str] = []
+
+    def put(key: str, data: bytes, content_type: str) -> None:
+        writes.append(key)
+        objects[key] = (data, content_type)
+
+    def get(key: str) -> bytes:
+        return objects[key][0]
+
+    def delete(key: str) -> None:
+        deletes.append(key)
+        objects.pop(key, None)
+
+    monkeypatch.setattr(dynamic_query_service, "put_object", put)
+    monkeypatch.setattr(dynamic_query_service, "get_object_bytes", get)
+    monkeypatch.setattr(dynamic_query_service, "delete_object", delete)
+    return objects, writes, deletes
+
+
 def test_structured_generation_validation_rejects_ambiguous_results():
     """The service never persists an empty continuation or mixed stop result."""
 
@@ -27,24 +66,90 @@ def test_structured_generation_validation_rejects_ambiguous_results():
         "done": False,
         "messages": ["继续追问"],
         "stop_reason": None,
-    }) == (False, ["继续追问"], None)
+        "raw_content": None,
+    }, expects_image_raw_content=False) == (False, ["继续追问"], None, None)
     assert dynamic_query_service._validated_generation({
         "done": True,
         "messages": [],
         "stop_reason": "测试目标已覆盖",
-    }) == (True, [], "测试目标已覆盖")
+        "raw_content": None,
+    }, expects_image_raw_content=False) == (True, [], "测试目标已覆盖", None)
     with pytest.raises(ValueError):
         dynamic_query_service._validated_generation({
             "done": False,
             "messages": [],
             "stop_reason": None,
-        })
+            "raw_content": None,
+        }, expects_image_raw_content=False)
     with pytest.raises(ValueError):
         dynamic_query_service._validated_generation({
             "done": True,
             "messages": ["结束时不应有消息"],
             "stop_reason": "结束",
-        })
+            "raw_content": None,
+        }, expects_image_raw_content=False)
+
+    with pytest.raises(ValueError, match="缺少 raw_content"):
+        dynamic_query_service._validated_generation({
+            "done": False,
+            "messages": ["继续追问"],
+            "stop_reason": None,
+        }, expects_image_raw_content=False)
+    with pytest.raises(ValueError, match="必须返回非空 raw_content"):
+        dynamic_query_service._validated_generation({
+            "done": False,
+            "messages": ["继续追问"],
+            "stop_reason": None,
+            "raw_content": None,
+        }, expects_image_raw_content=True)
+    with pytest.raises(ValueError, match="必须为 null"):
+        dynamic_query_service._validated_generation({
+            "done": False,
+            "messages": ["继续追问"],
+            "stop_reason": None,
+            "raw_content": "没有图片时不应返回内容",
+        }, expects_image_raw_content=False)
+
+
+def test_response_image_validation_enforces_type_signature_and_limits(monkeypatch):
+    """Reject unsupported, disguised and oversized reply attachments early."""
+
+    valid = dynamic_query_service._validated_response_images([_reply_image()])
+    assert valid[0].content_type == "image/png"
+    assert len(valid[0].sha256) == 64
+    jpeg = dynamic_query_service._validated_response_images([
+        _reply_image(b"\xff\xd8\xffjpeg", "image/jpeg"),
+    ])
+    webp = dynamic_query_service._validated_response_images([
+        _reply_image(b"RIFF\x04\x00\x00\x00WEBPdata", "image/webp; charset=binary"),
+    ])
+    assert jpeg[0].content_type == "image/jpeg"
+    assert webp[0].content_type == "image/webp"
+
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="类型不受支持"):
+        dynamic_query_service._validated_response_images([
+            _reply_image(content_type="image/gif"),
+        ])
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="声明类型不一致"):
+        dynamic_query_service._validated_response_images([
+            _reply_image(data=b"not-a-png"),
+        ])
+
+    # The configured boundary accepts ten ordered attachments and rejects the
+    # eleventh, protecting the user-facing limit from accidental regression.
+    ten_images = dynamic_query_service._validated_response_images([_reply_image()] * 10)
+    assert len(ten_images) == 10
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="最多上传"):
+        dynamic_query_service._validated_response_images([_reply_image()] * 11)
+
+    monkeypatch.setattr(dynamic_query_service, "MAX_RESPONSE_IMAGE_BYTES", len(PNG_REPLY) - 1)
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="超过 5 MiB"):
+        dynamic_query_service._validated_response_images([_reply_image()])
+
+    monkeypatch.setattr(dynamic_query_service, "MAX_RESPONSE_IMAGE_BYTES", 1024)
+    monkeypatch.setattr(dynamic_query_service, "MAX_RESPONSE_IMAGES_TOTAL_BYTES", len(PNG_REPLY) * 2 - 1)
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="总大小"):
+        dynamic_query_service._validated_response_images([_reply_image(), _reply_image()])
 
 
 def _seed_dynamic_case(db_session):
@@ -180,7 +285,12 @@ async def test_real_response_generates_and_persists_r2(db_session, monkeypatch):
             "completion_tokens": 5,
             "total_tokens": 15,
         })
-        return {"done": False, "messages": ["医生有没有说还要等最终病理？"], "stop_reason": None}
+        return {
+            "done": False,
+            "messages": ["医生有没有说还要等最终病理？"],
+            "stop_reason": None,
+            "raw_content": None,
+        }
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", fake_llm)
     result = await dynamic_query_service.advance_next_turn(
@@ -207,6 +317,235 @@ async def test_real_response_generates_and_persists_r2(db_session, monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_image_only_and_combined_responses_send_only_current_images(
+    db_session,
+    monkeypatch,
+):
+    """Persist image-only replies and avoid replaying prior images to the LLM."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    objects, writes, _ = _install_memory_storage(monkeypatch)
+    calls: list[dict] = []
+
+    async def fake_llm(**kwargs):
+        calls.append(kwargs)
+        return {
+            "done": False,
+            "messages": [f"动态追问 {len(calls) + 1}"],
+            "stop_reason": None,
+            "raw_content": f"截图原文 {len(calls)}",
+        }
+
+    monkeypatch.setattr(dynamic_query_service, "run_structured", fake_llm)
+    second = await dynamic_query_service.advance_next_turn(
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        None,
+        [_reply_image()],
+    )
+    assert second.round == 2
+    assert calls[0]["images"] == [(PNG_REPLY, "image/png")]
+    assert "raw_content" in calls[0]["schema"]["required"]
+
+    first_turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=first.conversation_id,
+        round=1,
+    ).one()
+    assert first_turn.tested_response is None
+    assert first_turn.answered_at is not None
+    assert first_turn.tested_response_raw_content == "截图原文 1"
+    assert len(first_turn.tested_response_images) == 1
+    stored = first_turn.tested_response_images[0]
+    assert stored["object_key"] in objects
+    assert stored["size"] == len(PNG_REPLY)
+    assert stored["object_key"] not in calls[0]["user_text"]
+    assert stored["sha256"] not in calls[0]["user_text"]
+
+    third = await dynamic_query_service.advance_next_turn(
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "这次同时提供文字和截图。",
+        [_reply_image(PNG_REPLY_2)],
+    )
+    assert third.round == 3
+    assert calls[1]["images"] == [(PNG_REPLY_2, "image/png")]
+    assert PNG_REPLY not in [raw for raw, _ in calls[1]["images"]]
+    assert '"tested_response_image_count": 1' in calls[1]["user_text"]
+    assert '"attachment_index": 1' in calls[1]["user_text"]
+    assert '"tested_response_raw_content": "截图原文 1"' in calls[1]["user_text"]
+    assert len(writes) == 2
+
+
+@pytest.mark.anyio
+async def test_image_generation_failure_reuses_objects_and_requires_same_order(
+    db_session,
+    monkeypatch,
+):
+    """An image retry compares ordered hashes and never uploads duplicates."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    _, writes, _ = _install_memory_storage(monkeypatch)
+
+    async def fail_llm(**kwargs):
+        raise LLMStructuredError("模拟图片生成失败")
+
+    monkeypatch.setattr(dynamic_query_service, "run_structured", fail_llm)
+    original_images = [_reply_image(PNG_REPLY), _reply_image(PNG_REPLY_2)]
+    with pytest.raises(dynamic_query_service.DynamicQueryGenerationFailed):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "包含两张截图。",
+            original_images,
+        )
+    assert len(writes) == 2
+
+    with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="完全相同"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "包含两张截图。",
+            list(reversed(original_images)),
+        )
+
+    async def recover_llm(**kwargs):
+        return {
+            "done": False,
+            "messages": ["继续追问"],
+            "stop_reason": None,
+            "raw_content": "包含两张截图。",
+        }
+
+    monkeypatch.setattr(dynamic_query_service, "run_structured", recover_llm)
+    recovered = await dynamic_query_service.advance_next_turn(
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "包含两张截图。",
+        original_images,
+    )
+    assert recovered.round == 2
+    assert len(writes) == 2
+    persisted = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=first.conversation_id,
+        round=1,
+    ).one()
+    assert [item["sha256"] for item in persisted.tested_response_images] == [
+        dynamic_query_service._validated_response_images([image])[0].sha256
+        for image in original_images
+    ]
+
+
+@pytest.mark.anyio
+async def test_partial_image_upload_is_cleaned_and_answer_remains_open(
+    db_session,
+    monkeypatch,
+):
+    """A failed attachment write removes earlier objects and saves no reply."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    stored: dict[str, bytes] = {}
+    deleted: list[str] = []
+    upload_count = 0
+
+    def failing_put(key: str, data: bytes, content_type: str) -> None:
+        nonlocal upload_count
+        upload_count += 1
+        if upload_count == 2:
+            raise RuntimeError("模拟对象存储失败")
+        stored[key] = data
+
+    def delete(key: str) -> None:
+        deleted.append(key)
+        stored.pop(key, None)
+
+    monkeypatch.setattr(dynamic_query_service, "put_object", failing_put)
+    monkeypatch.setattr(dynamic_query_service, "delete_object", delete)
+    with pytest.raises(dynamic_query_service.DynamicQueryGenerationFailed, match="图片保存失败"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "上传中断",
+            [_reply_image(PNG_REPLY), _reply_image(PNG_REPLY_2)],
+        )
+
+    db_session.expire_all()
+    conversation = db_session.get(DynamicConversation, first.conversation_id)
+    turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=first.conversation_id,
+        round=1,
+    ).one()
+    assert conversation.status == "awaiting_response"
+    assert turn.answered_at is None
+    assert turn.tested_response is None
+    assert turn.tested_response_images == []
+    assert len(deleted) == 1
+    assert stored == {}
+
+
+@pytest.mark.anyio
+async def test_database_failure_after_image_upload_cleans_objects(
+    db_session,
+    monkeypatch,
+):
+    """A failed reply transaction does not leave an unreferenced MinIO object."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    objects, _, deletes = _install_memory_storage(monkeypatch)
+    original_commit = db_session.commit
+
+    def failing_commit() -> None:
+        raise RuntimeError("模拟数据库提交失败")
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    with pytest.raises(dynamic_query_service.DynamicQueryGenerationFailed, match="回复内容保存失败"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "数据库写入失败",
+            [_reply_image()],
+        )
+    monkeypatch.setattr(db_session, "commit", original_commit)
+
+    db_session.expire_all()
+    conversation = db_session.get(DynamicConversation, first.conversation_id)
+    turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=first.conversation_id,
+        round=1,
+    ).one()
+    assert conversation.status == "awaiting_response"
+    assert turn.answered_at is None
+    assert turn.tested_response_images == []
+    assert len(deletes) == 1
+    assert objects == {}
+
+
+@pytest.mark.anyio
 async def test_model_can_finish_early(db_session, monkeypatch):
     actor, query, variant = _seed_dynamic_case(db_session)
     first = await dynamic_query_service.advance_next_turn(
@@ -214,7 +553,12 @@ async def test_model_can_finish_early(db_session, monkeypatch):
     )
 
     async def fake_llm(**kwargs):
-        return {"done": True, "messages": [], "stop_reason": "目标已充分覆盖"}
+        return {
+            "done": True,
+            "messages": [],
+            "stop_reason": "目标已充分覆盖",
+            "raw_content": None,
+        }
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", fake_llm)
     result = await dynamic_query_service.advance_next_turn(
@@ -256,7 +600,12 @@ async def test_generation_failure_preserves_response_and_allows_same_retry(db_se
         )
 
     async def recover_llm(**kwargs):
-        return {"done": False, "messages": ["那最终病理大概什么时候出？"], "stop_reason": None}
+        return {
+            "done": False,
+            "messages": ["那最终病理大概什么时候出？"],
+            "stop_reason": None,
+            "raw_content": None,
+        }
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", recover_llm)
     recovered = await dynamic_query_service.advance_next_turn(
@@ -290,21 +639,52 @@ async def test_round_four_response_stops_without_llm(db_session, monkeypatch):
     async def should_not_call_llm(**kwargs):
         raise AssertionError("R4 response must stop before an LLM call")
 
+    objects, writes, _ = _install_memory_storage(monkeypatch)
     monkeypatch.setattr(dynamic_query_service, "run_structured", should_not_call_llm)
     result = await dynamic_query_service.advance_next_turn(
-        db_session, actor.id, query.id, variant.id, "第四轮答复"
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "第四轮答复",
+        [_reply_image()],
     )
     assert result.done is True
     assert result.round == 4
     assert result.stop_reason == "max_rounds"
+    fourth_turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=conversation.id,
+        round=4,
+    ).one()
+    assert fourth_turn.answered_at is not None
+    assert len(fourth_turn.tested_response_images) == 1
+    assert fourth_turn.tested_response_images[0]["object_key"] in objects
+    assert len(writes) == 1
 
 
 @pytest.mark.anyio
-async def test_rejects_variant_outside_query_and_blank_response(db_session):
+async def test_rejects_variant_outside_query_first_call_images_and_blank_response(
+    db_session,
+    monkeypatch,
+):
     actor, query, variant = _seed_dynamic_case(db_session)
     with pytest.raises(dynamic_query_service.DynamicQueryNotFound):
         await dynamic_query_service.advance_next_turn(
             db_session, actor.id, query.id, uuid.uuid4(), None
+        )
+
+    def should_not_store(*args):
+        raise AssertionError("A first call must not accept reply images")
+
+    monkeypatch.setattr(dynamic_query_service, "put_object", should_not_store)
+    with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="先获取第一轮"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            None,
+            [_reply_image()],
         )
 
     await dynamic_query_service.advance_next_turn(
@@ -341,7 +721,12 @@ async def test_timeout_preserves_retryable_failed_state(db_session, monkeypatch)
 
     async def slow_llm(**kwargs):
         await asyncio.sleep(1)
-        return {"done": False, "messages": ["不会返回"], "stop_reason": None}
+        return {
+            "done": False,
+            "messages": ["不会返回"],
+            "stop_reason": None,
+            "raw_content": None,
+        }
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", slow_llm)
     monkeypatch.setattr(dynamic_query_service, "DYNAMIC_QUERY_TIMEOUT_SECONDS", 0.001)

@@ -2,10 +2,11 @@ import uuid
 from urllib.parse import quote
 
 from arq.connections import ArqRedis
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
+from app.api.dynamic_query_adapter import advance_next_turn_http
 from app.api.deps import get_arq_pool, get_current_user, require_role
 from app.core.storage import get_object_bytes
 from app.db.models.user import User
@@ -33,6 +34,7 @@ from app.schemas.case import (
     RunAgentFIn,
     VariantSelectIn,
 )
+from app.schemas.dynamic_query import NextTurnOut
 from app.services import case_service
 
 router = APIRouter(prefix="/cases", tags=["cases"])
@@ -225,6 +227,39 @@ def decide_query(
 ):
     case = case_service.get_case_or_404(db, case_id)
     return case_service.decide_query(db, case, query_id, body.decision, user, body.reason)
+
+
+@router.post("/{case_id}/queries/{query_id}/next-turn", response_model=NextTurnOut)
+async def advance_dynamic_query(
+    case_id: uuid.UUID,
+    query_id: uuid.UUID,
+    variant_id: uuid.UUID = Form(...),
+    latest_response: str | None = Form(default=None, max_length=100_000),
+    response_images: list[UploadFile] | None = File(default=None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> NextTurnOut:
+    """Validate case ownership before delegating to the shared HTTP adapter."""
+
+    case = case_service.get_case_or_404(db, case_id)
+    query_belongs_to_case = any(
+        query.id == query_id
+        for cutpoint in case.cutpoints
+        for query in cutpoint.queries
+    )
+    if not query_belongs_to_case:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "用例不存在或不属于该病例",
+        )
+    return await advance_next_turn_http(
+        db=db,
+        user=user,
+        query_id=query_id,
+        variant_id=variant_id,
+        latest_response=latest_response,
+        response_images=response_images,
+    )
 
 
 @router.patch("/{case_id}/variants/{variant_id}", response_model=QueryVariantOut)
