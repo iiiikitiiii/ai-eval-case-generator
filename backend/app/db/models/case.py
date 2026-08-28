@@ -350,6 +350,12 @@ class DynamicConversationTurn(Base):
     )
     round: Mapped[int] = mapped_column(Integer, nullable=False)
     user_messages: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
+    # Internal per-turn intent lets later generation understand why each prior
+    # question was asked without exposing test rationale to the tested system.
+    question_goal: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Keep answer expectations beside the exact question they evaluate. This
+    # lets later turns distinguish the case-wide rubric from each turn's focus.
+    expected_answer_points: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)
     image_seqs: Mapped[list[int]] = mapped_column(ARRAY(Integer), default=list)
     tested_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Store only durable object references and integrity metadata in Postgres;
