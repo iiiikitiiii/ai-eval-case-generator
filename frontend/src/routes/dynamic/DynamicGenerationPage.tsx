@@ -2,7 +2,14 @@ import { useEffect, useId, useMemo, useState, type CSSProperties, type KeyboardE
 import { listPersonas, listScenarioTypes } from "../../shared/api/agents";
 import { getCase, listCases } from "../../shared/api/cases";
 import { ApiError } from "../../shared/api/client";
-import { advanceDynamicQuery } from "../../shared/api/dynamic";
+import {
+  advanceDynamicQuery,
+  listDynamicConversations,
+  renameDynamicConversation,
+  startDynamicConversation,
+  type DynamicConversationRecord,
+  type DynamicConversationStatus,
+} from "../../shared/api/dynamic";
 import type { CaseDetail, CaseListItem, ScenarioTypeOut, UserPersonaOut } from "../../shared/api/types";
 import { useAuth } from "../../shared/auth/AuthContext";
 import { Lightbox } from "../../shared/ui/Lightbox";
@@ -41,13 +48,47 @@ interface DynamicHistoryTurn {
   images: number[];
   responseText: string | null;
   responseImageNames: string[];
+  responseImageCount: number;
+  responseRawContent: string | null;
 }
 
 interface DynamicConversationView {
   conversationId: string;
+  name: string | null;
+  status: DynamicConversationStatus;
+  createdAt: string;
   turns: DynamicHistoryTurn[];
   done: boolean;
   stopReason: string | null;
+}
+
+/** Convert the durable API record into the page's rendering-oriented shape. */
+function toConversationView(record: DynamicConversationRecord): DynamicConversationView {
+  return {
+    conversationId: record.conversation_id,
+    name: record.name,
+    status: record.status,
+    createdAt: record.created_at,
+    turns: record.turns.map((turn) => ({
+      round: turn.round,
+      messages: turn.messages,
+      images: turn.images,
+      responseText: turn.tested_response,
+      responseImageNames: [],
+      responseImageCount: turn.tested_response_image_count,
+      responseRawContent: turn.tested_response_raw_content,
+    })),
+    done: record.status === "completed" || record.status === "abandoned",
+    stopReason: record.stop_reason,
+  };
+}
+
+function conversationStatusLabel(status: DynamicConversationStatus) {
+  if (status === "awaiting_response") return "进行中";
+  if (status === "generating") return "生成中";
+  if (status === "generation_failed") return "生成失败";
+  if (status === "abandoned") return "已停止";
+  return "已完成";
 }
 
 const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -244,8 +285,11 @@ export function DynamicGenerationPage() {
   const [screenshots, setScreenshots] = useState<File[]>([]);
   const [screenshotPreviews, setScreenshotPreviews] = useState<ScreenshotPreview[]>([]);
   const [screenshotError, setScreenshotError] = useState<string | null>(null);
-  const [selectedQueryId, setSelectedQueryId] = useState("");
   const [conversation, setConversation] = useState<DynamicConversationView | null>(null);
+  const [conversationRecords, setConversationRecords] = useState<DynamicConversationRecord[]>([]);
+  const [loadingConversations, setLoadingConversations] = useState(false);
+  const [conversationNameDraft, setConversationNameDraft] = useState("");
+  const [isSavingConversationName, setIsSavingConversationName] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [generationError, setGenerationError] = useState<string | null>(null);
   const [retryLocked, setRetryLocked] = useState(false);
@@ -407,12 +451,66 @@ export function DynamicGenerationPage() {
       });
     });
   }, [eligibleCutpoints, selectedPersonaId, selectedScenario, selectedStage]);
-  const selectedTarget = selectedTestCases.find(({ query }) => query.id === selectedQueryId) ?? null;
+  // The filtered result is immediately usable; no second explicit selection
+  // step is required before loading history or starting a test.
+  const selectedTarget = selectedTestCases[0] ?? null;
   const selectedVariant = selectedTarget?.query.variants[0] ?? null;
   const hasResponseContent = !!responseText.trim() || screenshots.length > 0;
+  const conversationCanRespond = conversation?.status === "awaiting_response";
+  const conversationCanRetry = conversation?.status === "generation_failed" || retryLocked;
   const canSubmit = !!selectedTarget
     && !isGenerating
-    && (!conversation || (!conversation.done && hasResponseContent));
+    && !!conversation
+    && ((conversationCanRespond && hasResponseContent) || conversationCanRetry);
+  const canStartNewTest = !!selectedTarget
+    && !loadingConversations
+    && !isGenerating;
+  const normalizedConversationName = conversationNameDraft.trim();
+  const canSaveConversationName = !!conversation
+    && !isGenerating
+    && !isSavingConversationName
+    && normalizedConversationName.length <= 120
+    && normalizedConversationName !== (conversation.name ?? "");
+
+  // Selecting a concrete query/persona loads only this account's durable runs.
+  // The newest record is shown first, while the selector below can browse any
+  // earlier completed or stopped test without mutating it.
+  useEffect(() => {
+    let cancelled = false;
+    if (!selectedTarget || !selectedVariant) {
+      setConversationRecords([]);
+      setConversation(null);
+      setConversationNameDraft("");
+      setLoadingConversations(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+    setLoadingConversations(true);
+    setGenerationError(null);
+    listDynamicConversations(selectedCaseId, selectedTarget.query.id, selectedVariant.id)
+      .then((records) => {
+        if (cancelled) return;
+        setConversationRecords(records);
+        const latest = records[0] ?? null;
+        setConversation(latest ? toConversationView(latest) : null);
+        setConversationNameDraft(latest?.name ?? "");
+      })
+      .catch((requestError) => {
+        if (!cancelled) {
+          setConversationRecords([]);
+          setConversation(null);
+          setConversationNameDraft("");
+          setGenerationError(requestError instanceof ApiError ? requestError.message : "加载历史测试失败");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingConversations(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedCaseId, selectedTarget, selectedVariant]);
 
   // Validate restored identifiers only after their authoritative option data
   // has loaded. Invalid parents clear every dependent value in the snapshot.
@@ -480,16 +578,13 @@ export function DynamicGenerationPage() {
     // A conversation belongs to one exact case/query/persona combination and
     // must never survive a target change in the current page instance.
     clearResponseDraft();
-    setSelectedQueryId("");
     setConversation(null);
+    setConversationRecords([]);
+    setConversationNameDraft("");
+    setIsSavingConversationName(false);
+    setLoadingConversations(false);
     setGenerationError(null);
     setRetryLocked(false);
-  }
-
-  function chooseQuery(queryId: string) {
-    if (isGenerating || queryId === selectedQueryId) return;
-    resetDynamicRun();
-    setSelectedQueryId(queryId);
   }
 
   function selectScreenshots(files: File[]) {
@@ -537,10 +632,77 @@ export function DynamicGenerationPage() {
     setGenerationError(null);
   }
 
+  function chooseConversation(conversationId: string) {
+    const record = conversationRecords.find((item) => item.conversation_id === conversationId);
+    if (!record || isGenerating) return;
+    clearResponseDraft();
+    setConversation(toConversationView(record));
+    setConversationNameDraft(record.name ?? "");
+    setGenerationError(null);
+    setRetryLocked(false);
+  }
+
+  async function startNewTest() {
+    if (!selectedTarget || !selectedVariant || isGenerating) return;
+    setIsGenerating(true);
+    setGenerationError(null);
+    try {
+      const record = await startDynamicConversation(
+        selectedCaseId,
+        selectedTarget.query.id,
+        selectedVariant.id,
+      );
+      // Reload the isolated records so the new run appears without mutating
+      // any earlier active test selected by its own conversation ID.
+      const records = await listDynamicConversations(
+        selectedCaseId,
+        selectedTarget.query.id,
+        selectedVariant.id,
+      );
+      setConversationRecords(records);
+      setConversation(toConversationView(
+        records.find((item) => item.conversation_id === record.conversation_id) ?? record,
+      ));
+      setConversationNameDraft(record.name ?? "");
+      clearResponseDraft();
+      setRetryLocked(false);
+    } catch (requestError) {
+      setGenerationError(requestError instanceof ApiError ? requestError.message : "新建动态测试失败");
+    } finally {
+      setIsGenerating(false);
+    }
+  }
+
+  async function saveConversationName() {
+    if (!selectedTarget || !conversation || !canSaveConversationName) return;
+    setIsSavingConversationName(true);
+    setGenerationError(null);
+    try {
+      const record = await renameDynamicConversation(
+        selectedCaseId,
+        selectedTarget.query.id,
+        conversation.conversationId,
+        normalizedConversationName || null,
+      );
+      setConversationRecords((current) => current.map((item) => (
+        item.conversation_id === record.conversation_id ? record : item
+      )));
+      setConversation(toConversationView(record));
+      setConversationNameDraft(record.name ?? "");
+    } catch (requestError) {
+      setGenerationError(requestError instanceof ApiError ? requestError.message : "保存测试记录名称失败");
+    } finally {
+      setIsSavingConversationName(false);
+    }
+  }
+
   async function advanceConversation() {
-    if (!selectedTarget || !selectedVariant || !canSubmit) return;
+    if (!selectedTarget || !selectedVariant || !conversation || !canSubmit) return;
     const submittedText = responseText.trim();
     const submittedImages = [...screenshots];
+    // Failed generations already have an immutable answer stored server-side.
+    // Retrying by ID avoids requiring the browser to reconstruct prior Files.
+    const retryStoredResponse = conversation.status === "generation_failed" || retryLocked;
     setIsGenerating(true);
     setGenerationError(null);
     try {
@@ -548,75 +710,77 @@ export function DynamicGenerationPage() {
         selectedCaseId,
         selectedTarget.query.id,
         selectedVariant.id,
-        conversation ? submittedText || null : null,
-        conversation ? submittedImages : [],
+        retryStoredResponse ? null : submittedText || null,
+        retryStoredResponse ? [] : submittedImages,
+        conversation.conversationId,
       );
-      if (!conversation) {
-        // The first call retrieves durable seed R1 without submitting a reply.
-        setConversation({
-          conversationId: result.conversation_id,
-          turns: [{
+      setConversation((current) => {
+        if (!current) return current;
+        const turns = current.turns.map((turn, index) => index === current.turns.length - 1
+          ? {
+              ...turn,
+              responseText: submittedText || null,
+              responseImageNames: submittedImages.map((file) => file.name),
+              responseImageCount: submittedImages.length,
+              responseRawContent: null,
+            }
+          : turn);
+        if (!result.done) {
+          turns.push({
             round: result.round,
             messages: result.messages,
             images: result.images,
             responseText: null,
             responseImageNames: [],
-          }],
+            responseImageCount: 0,
+            responseRawContent: null,
+          });
+        }
+        return {
+          ...current,
+          status: result.done ? "completed" : "awaiting_response",
+          turns,
           done: result.done,
           stopReason: result.stop_reason,
-        });
-      } else {
-        setConversation((current) => {
-          if (!current) return current;
-          const turns = current.turns.map((turn, index) => index === current.turns.length - 1
-            ? {
-                ...turn,
-                responseText: submittedText || null,
-                responseImageNames: submittedImages.map((file) => file.name),
-              }
-            : turn);
-          if (!result.done) {
-            turns.push({
-              round: result.round,
-              messages: result.messages,
-              images: result.images,
-              responseText: null,
-              responseImageNames: [],
-            });
-          }
-          return {
-            ...current,
-            turns,
-            done: result.done,
-            stopReason: result.stop_reason,
-          };
-        });
-        clearResponseDraft();
+        };
+      });
+      const records = await listDynamicConversations(
+        selectedCaseId,
+        selectedTarget.query.id,
+        selectedVariant.id,
+      ).catch(() => null);
+      if (records) {
+        setConversationRecords(records);
+        const persisted = records.find((item) => item.conversation_id === result.conversation_id);
+        if (persisted) setConversation(toConversationView(persisted));
       }
+      clearResponseDraft();
       setRetryLocked(false);
     } catch (requestError) {
       const apiError = requestError instanceof ApiError ? requestError : null;
       setGenerationError(apiError?.message ?? "动态问题生成失败，请稍后重试");
-      // The service persists answers before calling the LLM. A gateway error
-      // therefore locks the exact draft so retries cannot overwrite it.
-      if (apiError?.status === 502 || apiError?.status === 504) setRetryLocked(true);
+      // The service persists answers before calling the LLM. Mark this exact
+      // conversation retryable and disable draft edits; retry uses its ID.
+      if (apiError?.status === 502 || apiError?.status === 504) {
+        setRetryLocked(true);
+        setConversation((current) => current ? { ...current, status: "generation_failed" } : current);
+        setConversationRecords((current) => current.map((record) => (
+          record.conversation_id === conversation.conversationId
+            ? { ...record, status: "generation_failed", last_error: apiError.message }
+            : record
+        )));
+      }
     } finally {
       setIsGenerating(false);
     }
   }
 
-  const composerDisabled = !conversation || conversation.done || isGenerating || retryLocked;
+  const composerDisabled = !conversationCanRespond || isGenerating || retryLocked;
   const actionLabel = isGenerating
     ? "生成中…"
-    : conversation?.done
-      ? "已完成"
-      : retryLocked
-        ? "重试生成"
-        : conversation
-          ? "生成下一轮问题"
-          : selectedTarget
-            ? "开始动态跑测"
-            : "请选择用例";
+    : conversationCanRetry
+      ? "重试生成"
+      : "生成下一轮问题";
 
   return (
     <div style={{ padding: "24px 32px 60px" }}>
@@ -689,7 +853,7 @@ export function DynamicGenerationPage() {
               </span>
             </div>
             {caseDetail && selectedTestCases.map(({ cutpoint, query }) => {
-              const isSelected = query.id === selectedQueryId;
+              const isSelected = query.id === selectedTarget?.query.id;
               // Dynamic preview deliberately exposes only seed R1; generated
               // R2-R4 from Agent F must not influence this workflow.
               const seedOnlyQuery = {
@@ -709,16 +873,6 @@ export function DynamicGenerationPage() {
                     marginBottom: 10,
                   }}
                 >
-                  <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 4 }}>
-                    <button
-                      type="button"
-                      disabled={isGenerating || isSelected}
-                      onClick={() => chooseQuery(query.id)}
-                      style={querySelectButtonStyle(isSelected, !isGenerating)}
-                    >
-                      {isSelected ? "当前跑测用例" : "选择此用例"}
-                    </button>
-                  </div>
                   <QueryCard
                     caseId={selectedCaseId}
                     documents={caseDetail.documents}
@@ -732,16 +886,81 @@ export function DynamicGenerationPage() {
               );
             })}
 
+            {selectedTarget && selectedVariant && (
+              <div style={{ borderTop: "1px solid var(--line)", marginTop: 14, paddingTop: 14 }}>
+                <div style={{ display: "flex", alignItems: "flex-end", gap: 10, flexWrap: "wrap" }}>
+                  <label style={{ display: "grid", gap: 5, minWidth: 260, flex: "1 1 320px" }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: "var(--sub)" }}>测试记录</span>
+                    <select
+                      value={conversation?.conversationId ?? ""}
+                      disabled={loadingConversations || isGenerating || conversationRecords.length === 0}
+                      onChange={(event) => chooseConversation(event.target.value)}
+                      style={{ ...responseInputStyle, minHeight: 36, padding: "7px 9px" }}
+                    >
+                      {conversationRecords.length === 0 && (
+                        <option value="">{loadingConversations ? "正在加载历史测试…" : "暂无历史测试"}</option>
+                      )}
+                      {conversationRecords.map((record, index) => (
+                        <option key={record.conversation_id} value={record.conversation_id}>
+                          {`${record.name || `第 ${conversationRecords.length - index} 次`} · ${new Date(record.created_at).toLocaleString()} · ${conversationStatusLabel(record.status)}`}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button"
+                    disabled={!canStartNewTest}
+                    onClick={startNewTest}
+                    style={generateButtonStyle(canStartNewTest)}
+                  >
+                    {conversationRecords.length > 0 ? "新开测试" : "开始首次测试"}
+                  </button>
+                </div>
+                {conversation && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                    <input
+                      value={conversationNameDraft}
+                      maxLength={120}
+                      disabled={isSavingConversationName}
+                      placeholder="给这次测试命名（可选）"
+                      aria-label="测试记录名称"
+                      onChange={(event) => setConversationNameDraft(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && canSaveConversationName) saveConversationName();
+                      }}
+                      style={{ ...responseInputStyle, minHeight: 36, padding: "7px 9px", flex: "1 1 260px" }}
+                    />
+                    <button
+                      type="button"
+                      disabled={!canSaveConversationName}
+                      onClick={saveConversationName}
+                      style={generateButtonStyle(canSaveConversationName)}
+                    >
+                      {isSavingConversationName ? "保存中…" : "保存名称"}
+                    </button>
+                  </div>
+                )}
+                {generationError && (
+                  <div style={{ color: "var(--red)", fontSize: 11.5, marginTop: 7 }}>{generationError}</div>
+                )}
+              </div>
+            )}
+
             {conversation && (
               <div style={{ marginTop: 18 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: "var(--navy)", marginBottom: 10 }}>
-                  动态跑测记录
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 10 }}>
+                  <span style={{ fontSize: 14, fontWeight: 700, color: "var(--navy)" }}>
+                    动态跑测记录{conversation.name ? ` · ${conversation.name}` : ""}
+                  </span>
+                  <span style={{ fontSize: 11.5, color: "var(--muted)" }}>
+                    {conversationStatusLabel(conversation.status)} · {new Date(conversation.createdAt).toLocaleString()}
+                  </span>
                 </div>
                 {conversation.turns.map((turn) => (
                   <div key={turn.round} style={historyTurnStyle}>
                     <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                       <b style={{ color: "var(--navy)" }}>第 {turn.round} 轮问题</b>
-                      {turn.responseText === null && turn.responseImageNames.length === 0 && !conversation.done && (
+                      {turn.responseText === null && turn.responseImageCount === 0 && !conversation.done && (
                         <span style={{ color: "var(--muted)", fontSize: 11 }}>等待答复</span>
                       )}
                     </div>
@@ -760,22 +979,41 @@ export function DynamicGenerationPage() {
                         ))}
                       </div>
                     )}
-                    {(turn.responseText !== null || turn.responseImageNames.length > 0) && (
-                      <div style={{ background: "var(--surface)", borderRadius: 6, padding: "8px 10px", marginTop: 9 }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: "var(--sub)" }}>已提交答复</div>
-                        {turn.responseText && <div style={{ whiteSpace: "pre-wrap", marginTop: 3 }}>{turn.responseText}</div>}
-                        {turn.responseImageNames.length > 0 && (
-                          <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 4 }}>
-                            回复图片：{turn.responseImageNames.join("、")}
+                    {(turn.responseText !== null || turn.responseImageCount > 0) && (
+                      <details style={{ background: "var(--surface)", borderRadius: 6, padding: "8px 10px", marginTop: 9 }}>
+                        {/* Native details stays closed by default and keeps long
+                            tested-system answers from overwhelming the history. */}
+                        <summary style={{ fontSize: 11, fontWeight: 700, color: "var(--sub)", cursor: "pointer" }}>
+                          已提交答复
+                          {turn.responseImageCount > 0 ? ` · ${turn.responseImageCount} 张图片` : ""}
+                        </summary>
+                        {turn.responseText && <div style={{ whiteSpace: "pre-wrap", marginTop: 7 }}>{turn.responseText}</div>}
+                        {turn.responseImageCount > 0 && (
+                          <div style={{ color: "var(--muted)", fontSize: 11, marginTop: 6 }}>
+                            回复图片：{turn.responseImageNames.length > 0
+                              ? turn.responseImageNames.join("、")
+                              : `${turn.responseImageCount} 张`}
                           </div>
                         )}
-                      </div>
+                        {turn.responseImageCount > 0 && turn.responseRawContent && (
+                          <div style={{ borderTop: "1px solid var(--line)", marginTop: 8, paddingTop: 8 }}>
+                            <div style={{ fontSize: 11, fontWeight: 700, color: "var(--sub)" }}>
+                              模型返回的图片原始回复内容
+                            </div>
+                            <div style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>
+                              {turn.responseRawContent}
+                            </div>
+                          </div>
+                        )}
+                      </details>
                     )}
                   </div>
                 ))}
                 {conversation.done && (
                   <div style={{ color: "var(--green)", fontWeight: 700, marginTop: 8 }}>
-                    动态跑测已完成{conversation.stopReason ? `（${conversation.stopReason}）` : ""}
+                    {conversation.status === "abandoned"
+                      ? `该测试已停止${conversation.stopReason ? `（${conversation.stopReason}）` : ""}，历史记录仍可浏览`
+                      : `动态跑测已完成${conversation.stopReason ? `（${conversation.stopReason}）` : ""}`}
                   </div>
                 )}
               </div>
@@ -783,7 +1021,14 @@ export function DynamicGenerationPage() {
           </div>
 
           {!conversation?.done && (
-          <div style={{ ...panelStyle, display: "flex", flexDirection: "column", minHeight: 0 }}>
+          <div
+            style={{
+              ...panelStyle,
+              display: "flex",
+              flexDirection: "column",
+              minHeight: 0,
+            }}
+          >
           <div style={{ fontSize: 13, fontWeight: 700, color: "var(--navy)", marginBottom: 4 }}>
             被测系统答复
           </div>
@@ -791,7 +1036,7 @@ export function DynamicGenerationPage() {
             {!selectedTarget
               ? "请先从左侧显式选择一条用例。"
               : !conversation
-                ? "点击开始动态跑测，服务端将返回该画像的种子 R1。"
+                ? "点击左侧“开始首次测试”，服务端将返回该画像的种子 R1。"
                 : "可以输入文字、上传截图，或同时提供两者。成功提交后将在左侧保留本页记录。"}
           </div>
           <textarea
@@ -861,7 +1106,6 @@ export function DynamicGenerationPage() {
           </div>
 
           {screenshotError && <div style={{ color: "var(--red)", fontSize: 11.5, marginTop: 7 }}>{screenshotError}</div>}
-          {generationError && <div style={{ color: "var(--red)", fontSize: 11.5, marginTop: 7 }}>{generationError}</div>}
           {screenshotPreviews.length > 0 && (
             <div style={screenshotGridStyle}>
               {screenshotPreviews.map((preview, index) => (
@@ -1029,20 +1273,6 @@ const imageLinkStyle: CSSProperties = {
   fontSize: 10.5,
   cursor: "pointer",
 };
-
-function querySelectButtonStyle(selected: boolean, enabled: boolean): CSSProperties {
-  return {
-    padding: "5px 11px",
-    border: `1px solid ${selected ? "var(--navy)" : "var(--line)"}`,
-    borderRadius: 6,
-    background: selected ? "var(--navy)" : "var(--surface)",
-    color: selected ? "#fff" : "var(--navy)",
-    fontFamily: "inherit",
-    fontSize: 11.5,
-    fontWeight: 700,
-    cursor: enabled && !selected ? "pointer" : "default",
-  };
-}
 
 function generateButtonStyle(enabled: boolean): CSSProperties {
   return {

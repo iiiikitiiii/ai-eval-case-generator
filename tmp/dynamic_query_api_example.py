@@ -13,12 +13,13 @@ Examples (run from the repository root):
         --email runner@example.com \
         --query-id <query-uuid> \
         --variant-id <variant-uuid> \
+        --conversation-id <first-response-conversation-uuid> \
         --response "被测系统的文字答复" \
         --image "tmp/download (1).png"
 
-The server restores the active conversation by account and Query, so callers
-do not send ``conversation_id`` back. Omit ``--password`` to enter it without
-echoing it in the terminal.
+Omitting ``--conversation-id`` creates a new test and prints its generated ID.
+Save that ID and pass it on every later turn. Omit ``--password`` to enter it
+without echoing it in the terminal.
 """
 
 from __future__ import annotations
@@ -43,6 +44,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", help="登录密码；省略时安全输入")
     parser.add_argument("--query-id", required=True, help="种子用例 UUID")
     parser.add_argument("--variant-id", required=True, help="画像变体 UUID")
+    parser.add_argument(
+        "--conversation-id",
+        help="后续轮次必填；省略表示创建一条新测试",
+    )
     parser.add_argument("--response", help="被测系统的文字答复")
     parser.add_argument(
         "--image",
@@ -65,6 +70,7 @@ def login(client: httpx.Client, email: str, password: str) -> str:
 def build_multipart(
     stack: ExitStack,
     variant_id: str,
+    conversation_id: str | None,
     latest_response: str | None,
     image_paths: list[str],
 ) -> list[tuple[str, tuple[str | None, str | BinaryIO, str | None]]]:
@@ -76,6 +82,8 @@ def build_multipart(
     fields: list[tuple[str, tuple[str | None, str | BinaryIO, str | None]]] = [
         ("variant_id", (None, variant_id, None)),
     ]
+    if conversation_id:
+        fields.append(("conversation_id", (None, conversation_id, None)))
     if latest_response and latest_response.strip():
         fields.append(("latest_response", (None, latest_response.strip(), None)))
 
@@ -94,6 +102,10 @@ def main() -> None:
     """Authenticate and submit either the initial request or one response turn."""
 
     args = parse_args()
+    # An answer without a conversation ID would otherwise be interpreted as a
+    # malformed creation request by the API, so fail locally with a clear hint.
+    if (args.response or args.image) and not args.conversation_id:
+        raise ValueError("提交答复时必须传 --conversation-id")
     password = args.password or getpass.getpass("Password: ")
     base_url = args.base_url.rstrip("/")
 
@@ -103,6 +115,7 @@ def main() -> None:
             multipart = build_multipart(
                 stack,
                 args.variant_id,
+                args.conversation_id,
                 args.response,
                 args.image,
             )

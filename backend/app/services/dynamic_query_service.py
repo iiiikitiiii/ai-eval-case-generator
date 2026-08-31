@@ -1,8 +1,8 @@
 """Framework-independent dynamic query conversation orchestration.
 
-FastAPI adapters call only :func:`advance_next_turn`. This module owns the
-state machine, immutable generation context, LLM call and persistence so a
-future case-scoped web endpoint can reuse exactly the same behavior.
+FastAPI adapters call the transport-neutral functions in this module. It owns
+the state machine, immutable generation context, LLM call and persistence so
+internal and external routes reuse exactly the same behavior.
 """
 import asyncio
 import hashlib
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.storage import delete_object, get_object_bytes, put_object
@@ -148,6 +147,37 @@ class NextTurnResult:
     stop_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ConversationTurnHistory:
+    """Transport-neutral persisted turn returned for authenticated browsing."""
+
+    round: int
+    messages: list[str]
+    images: list[int]
+    tested_response: str | None
+    tested_response_image_count: int
+    tested_response_raw_content: str | None
+    created_at: datetime
+    answered_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ConversationHistory:
+    """One user's immutable dynamic test record for a concrete query variant."""
+
+    conversation_id: uuid.UUID
+    variant_id: uuid.UUID
+    name: str | None
+    status: str
+    current_round: int
+    stop_reason: str | None
+    last_error: str | None
+    created_at: datetime
+    updated_at: datetime
+    finished_at: datetime | None
+    turns: list[ConversationTurnHistory]
+
+
 def _now() -> datetime:
     """Return a timezone-aware UTC timestamp for persisted state changes."""
 
@@ -270,27 +300,111 @@ def _response_matches_retry(
     )
 
 
-def _active_conversation(
+def _conversation_for_actor(
     db: Session,
     actor_id: uuid.UUID,
     query_id: uuid.UUID,
+    conversation_id: uuid.UUID,
     *,
     lock: bool,
 ) -> DynamicConversation | None:
-    """Find the actor's unfinished conversation for a query.
-
-    ``lock=True`` adds ``FOR UPDATE`` for callers that are about to mutate the
-    state machine; read-only/idempotent lookups can skip the row lock.
-    """
+    """Load one explicit conversation without exposing another user's history."""
 
     query = db.query(DynamicConversation).filter(
+        DynamicConversation.id == conversation_id,
         DynamicConversation.started_by == actor_id,
         DynamicConversation.query_id == query_id,
-        DynamicConversation.status.in_(ACTIVE_DYNAMIC_CONVERSATION_STATUSES),
     )
     if lock:
         query = query.with_for_update()
     return query.first()
+
+
+def _history_result(conversation: DynamicConversation) -> ConversationHistory:
+    """Strip storage-internal reply metadata from one browseable history."""
+
+    return ConversationHistory(
+        conversation_id=conversation.id,
+        variant_id=conversation.variant_id,
+        name=conversation.name,
+        status=conversation.status,
+        current_round=conversation.current_round,
+        stop_reason=conversation.stop_reason,
+        last_error=conversation.last_error,
+        created_at=conversation.created_at,
+        updated_at=conversation.updated_at,
+        finished_at=conversation.finished_at,
+        turns=[
+            ConversationTurnHistory(
+                round=turn.round,
+                messages=list(turn.user_messages or []),
+                images=list(turn.image_seqs or []),
+                tested_response=turn.tested_response,
+                # Object keys and hashes remain server-internal; browsing only
+                # needs to show that ordered screenshot attachments existed.
+                tested_response_image_count=len(turn.tested_response_images or []),
+                # The multimodal model's verbatim transcription makes prior
+                # image-only replies readable without exposing storage keys.
+                tested_response_raw_content=turn.tested_response_raw_content,
+                created_at=turn.created_at,
+                answered_at=turn.answered_at,
+            )
+            for turn in conversation.turns
+        ],
+    )
+
+
+def list_conversation_history(
+    db: Session,
+    actor_id: uuid.UUID,
+    query_id: uuid.UUID,
+    variant_id: uuid.UUID,
+) -> list[ConversationHistory]:
+    """List only the caller's tests for one exact query/persona combination."""
+
+    # Validate the live query/variant pair before consulting durable logical
+    # identifiers so stale or mismatched page selections receive a clear 404.
+    variant = db.query(QueryVariant).filter(
+        QueryVariant.id == variant_id,
+        QueryVariant.query_id == query_id,
+    ).first()
+    if variant is None:
+        raise DynamicQueryNotFound("用例或画像脚本不存在，或画像不属于该用例")
+    conversations = db.query(DynamicConversation).filter(
+        DynamicConversation.started_by == actor_id,
+        DynamicConversation.query_id == query_id,
+        DynamicConversation.variant_id == variant_id,
+    ).order_by(DynamicConversation.created_at.desc()).all()
+    return [_history_result(conversation) for conversation in conversations]
+
+
+def rename_conversation(
+    db: Session,
+    actor_id: uuid.UUID,
+    query_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    name: str | None,
+) -> ConversationHistory:
+    """Set or clear an account-owned test name without changing its history."""
+
+    normalized_name = name.strip() if isinstance(name, str) else None
+    if normalized_name == "":
+        normalized_name = None
+    if normalized_name is not None and len(normalized_name) > 120:
+        raise DynamicQueryInvalidInput("测试记录名称不能超过 120 个字符")
+    conversation = _conversation_for_actor(
+        db,
+        actor_id,
+        query_id,
+        conversation_id,
+        lock=True,
+    )
+    if conversation is None:
+        raise DynamicQueryNotFound("动态测试记录不存在或不属于当前账号")
+    conversation.name = normalized_name
+    db.commit()
+    db.refresh(conversation)
+    return _history_result(conversation)
 
 
 def _current_turn(
@@ -433,14 +547,13 @@ def _start_conversation(
     actor_id: uuid.UUID,
     query_id: uuid.UUID,
     variant_id: uuid.UUID,
+    seed_data: tuple[dict[str, Any], list[str], list[int]] | None = None,
 ) -> NextTurnResult:
-    """Create a conversation and return its seed R1 without calling the LLM.
+    """Create an independent conversation and return seed R1 without the LLM."""
 
-    The partial unique index resolves simultaneous first requests. If another
-    request wins the race with the same variant, its pending R1 is returned.
-    """
-
-    snapshot, messages, images = _seed_context(db, query_id, variant_id)
+    # Every start is intentionally independent. Multiple active runs for the
+    # same account/query are distinguished by their generated conversation ID.
+    snapshot, messages, images = seed_data or _seed_context(db, query_id, variant_id)
     conversation = DynamicConversation(
         query_id=query_id,
         variant_id=variant_id,
@@ -450,33 +563,48 @@ def _start_conversation(
         context_snapshot=snapshot,
     )
     db.add(conversation)
-    try:
-        # Flush is inside the race handler because PostgreSQL can raise the
-        # partial-unique violation before commit.
-        db.flush()
-        turn = DynamicConversationTurn(
-            conversation_id=conversation.id,
-            round=1,
-            user_messages=messages,
-            question_goal=snapshot["dynamic_target"]["variant"]["seed_r1_question_goal"],
-            expected_answer_points=snapshot["dynamic_target"]["query"]["expected_answer_points"],
-            image_seqs=images,
-            source="seed",
-        )
-        db.add(turn)
-        db.commit()
-    except IntegrityError:
-        # The partial unique index is the final guard against simultaneous
-        # first calls. Return the winner's R1 when it chose the same persona.
-        db.rollback()
-        winner = _active_conversation(db, actor_id, query_id, lock=True)
-        if winner is None:
-            raise
-        if winner.variant_id != variant_id:
-            raise DynamicQueryConflict("该账号正在用另一套画像运行此用例")
-        return _result_for_turn(winner, _current_turn(db, winner))
+    db.flush()
+    turn = DynamicConversationTurn(
+        conversation_id=conversation.id,
+        round=1,
+        user_messages=messages,
+        question_goal=snapshot["dynamic_target"]["variant"]["seed_r1_question_goal"],
+        expected_answer_points=snapshot["dynamic_target"]["query"]["expected_answer_points"],
+        image_seqs=images,
+        source="seed",
+    )
+    db.add(turn)
+    db.commit()
     db.refresh(turn)
     return _result_for_turn(conversation, turn)
+
+
+def start_new_conversation(
+    db: Session,
+    actor_id: uuid.UUID,
+    query_id: uuid.UUID,
+    variant_id: uuid.UUID,
+) -> ConversationHistory:
+    """Start a distinct test without changing any earlier active or ended run."""
+
+    seed_data = _seed_context(db, query_id, variant_id)
+    result = _start_conversation(
+        db,
+        actor_id,
+        query_id,
+        variant_id,
+        seed_data=seed_data,
+    )
+    conversation = _conversation_for_actor(
+        db,
+        actor_id,
+        query_id,
+        result.conversation_id,
+        lock=False,
+    )
+    if conversation is None:
+        raise DynamicQueryConflict("新测试创建后无法读取")
+    return _history_result(conversation)
 
 
 def _generation_user_text(
@@ -754,13 +882,13 @@ async def advance_next_turn(
     variant_id: uuid.UUID,
     latest_response: str | None,
     response_images: list[ResponseImageInput] | None = None,
+    conversation_id: uuid.UUID | None = None,
 ) -> NextTurnResult:
-    """Start or advance one account/query conversation.
+    """Create a run without an ID, or advance exactly the supplied run ID.
 
-    No text or images creates or replays seed R1. Later turns accept text,
-    images, or both. Reply content is committed before the LLM call, and no row
-    lock is held while waiting on the provider. Domain exceptions are left for
-    HTTP adapters to translate.
+    An ID-less empty request always creates a new seed R1. Later calls must use
+    that ID, which prevents concurrent active tests for the same query from
+    sharing state. Reply content is committed before the provider call.
     """
 
     if latest_response is not None and not latest_response.strip():
@@ -768,27 +896,46 @@ async def advance_next_turn(
     validated_images = _validated_response_images(response_images)
     has_response_content = latest_response is not None or bool(validated_images)
 
-    conversation = _active_conversation(db, actor_id, query_id, lock=True)
-    if conversation is None:
+    if conversation_id is None:
         if has_response_content:
-            raise DynamicQueryConflict("当前没有进行中的会话，请先获取第一轮")
+            raise DynamicQueryInvalidInput(
+                "提交答复时必须传 conversation_id；省略该字段仅用于创建新测试"
+            )
         return _start_conversation(db, actor_id, query_id, variant_id)
+
+    conversation = _conversation_for_actor(
+        db,
+        actor_id,
+        query_id,
+        conversation_id,
+        lock=True,
+    )
+    if conversation is None:
+        raise DynamicQueryNotFound("动态测试记录不存在或不属于当前账号")
 
     if conversation.variant_id != variant_id:
         raise DynamicQueryConflict("variant_id 与当前会话使用的画像不一致")
+    if conversation.status not in ACTIVE_DYNAMIC_CONVERSATION_STATUSES:
+        raise DynamicQueryConflict("所选测试已经结束，只能浏览或新开测试")
     current_turn = _current_turn(db, conversation)
 
     if not has_response_content:
-        if conversation.status == "awaiting_response" and current_turn.answered_at is None:
-            return _result_for_turn(conversation, current_turn)
         if conversation.status == "generating":
             raise DynamicQueryConflict("服务端正在生成下一轮，请勿重复提交")
-        raise DynamicQueryConflict("上次生成失败，请用完全相同的文字和图片重试")
+        if conversation.status != "generation_failed":
+            raise DynamicQueryInvalidInput("推进测试时文字和图片至少需要提供一种")
 
     if conversation.status == "generating":
         raise DynamicQueryConflict("服务端正在生成下一轮，请勿重复提交")
     if conversation.status == "generation_failed":
-        if not _response_matches_retry(current_turn, latest_response, validated_images):
+        # An ID-only retry reuses the reply already committed before the failed
+        # provider call. If content is resubmitted, retain the strict immutable
+        # comparison for callers that still keep their original payload.
+        if has_response_content and not _response_matches_retry(
+            current_turn,
+            latest_response,
+            validated_images,
+        ):
             raise DynamicQueryConflict("上轮答复已经保存；重试时必须提交完全相同的文字和图片")
     elif conversation.status == "awaiting_response":
         if current_turn.answered_at is not None:

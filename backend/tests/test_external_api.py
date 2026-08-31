@@ -1,5 +1,7 @@
 """Integration tests for JWT-protected dynamic Query HTTP boundaries."""
 import uuid
+from dataclasses import replace
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -52,6 +54,12 @@ def test_login_token_reaches_external_next_turn_contract(monkeypatch):
         # The adapter must pass authenticated identity and request fields to
         # the reusable service without implementing conversation logic itself.
         assert kwargs["actor_id"] == user.id
+        if kwargs["conversation_id"] is None and (
+            kwargs["latest_response"] is not None or kwargs["response_images"]
+        ):
+            raise dynamic_query_service.DynamicQueryInvalidInput(
+                "提交答复时必须传 conversation_id"
+            )
         calls.append(kwargs)
         return dynamic_query_service.NextTurnResult(
             conversation_id=conversation_id,
@@ -94,18 +102,31 @@ def test_login_token_reaches_external_next_turn_contract(monkeypatch):
         assert "raw_content" not in response.json()
         assert calls[-1]["latest_response"] is None
         assert calls[-1]["response_images"] == []
+        assert calls[-1]["conversation_id"] is None
+
+        missing_conversation_id = client.post(
+            query_path,
+            headers={"Authorization": f"Bearer {token}"},
+            files=[
+                ("variant_id", (None, variant_id)),
+                ("latest_response", (None, "遗漏会话 ID 的答复")),
+            ],
+        )
+        assert missing_conversation_id.status_code == 422
 
         text_only = client.post(
             query_path,
             headers={"Authorization": f"Bearer {token}"},
             files=[
                 ("variant_id", (None, variant_id)),
+                ("conversation_id", (None, str(conversation_id))),
                 ("latest_response", (None, "纯文字答复")),
             ],
         )
         assert text_only.status_code == 200
         assert calls[-1]["latest_response"] == "纯文字答复"
         assert calls[-1]["response_images"] == []
+        assert calls[-1]["conversation_id"] == conversation_id
 
         png_1 = b"\x89PNG\r\n\x1a\nfirst"
         png_2 = b"\x89PNG\r\n\x1a\nsecond"
@@ -114,6 +135,7 @@ def test_login_token_reaches_external_next_turn_contract(monkeypatch):
             headers={"Authorization": f"Bearer {token}"},
             files=[
                 ("variant_id", (None, variant_id)),
+                ("conversation_id", (None, str(conversation_id))),
                 ("response_images", ("first.png", png_1, "image/png")),
                 ("response_images", ("second.png", png_2, "image/png")),
             ],
@@ -131,6 +153,7 @@ def test_login_token_reaches_external_next_turn_contract(monkeypatch):
             headers={"Authorization": f"Bearer {token}"},
             files=[
                 ("variant_id", (None, variant_id)),
+                ("conversation_id", (None, str(conversation_id))),
                 ("latest_response", (None, "文字和截图答复")),
                 ("response_images", ("reply.png", png_1, "image/png")),
             ],
@@ -201,6 +224,7 @@ def test_login_token_reaches_external_next_turn_contract(monkeypatch):
             headers={"Authorization": f"Bearer {token}"},
             files=[
                 ("variant_id", (None, variant_id)),
+                ("conversation_id", (None, str(conversation_id))),
                 ("latest_response", (None, "测试答复")),
             ],
         )
@@ -280,6 +304,46 @@ def test_case_scoped_next_turn_checks_query_and_reuses_multipart_adapter(monkeyp
         )
 
     monkeypatch.setattr(dynamic_query_service, "advance_next_turn", fake_advance_next_turn)
+    now = datetime.now(timezone.utc)
+    history = dynamic_query_service.ConversationHistory(
+        conversation_id=conversation_id,
+        variant_id=variant_id,
+        name=None,
+        status="awaiting_response",
+        current_round=1,
+        stop_reason=None,
+        last_error=None,
+        created_at=now,
+        updated_at=now,
+        finished_at=None,
+        turns=[dynamic_query_service.ConversationTurnHistory(
+            round=1,
+            messages=["种子第一轮"],
+            images=[1],
+            tested_response=None,
+            tested_response_image_count=1,
+            tested_response_raw_content="截图中的被测系统原始回复",
+            created_at=now,
+            answered_at=None,
+        )],
+    )
+    history_calls: list[tuple[str, dict]] = []
+
+    def fake_list_history(_db, **kwargs):
+        history_calls.append(("list", kwargs))
+        return [history]
+
+    def fake_start_history(_db, **kwargs):
+        history_calls.append(("start", kwargs))
+        return history
+
+    def fake_rename_history(_db, **kwargs):
+        history_calls.append(("rename", kwargs))
+        return replace(history, name=kwargs["name"])
+
+    monkeypatch.setattr(dynamic_query_service, "list_conversation_history", fake_list_history)
+    monkeypatch.setattr(dynamic_query_service, "start_new_conversation", fake_start_history)
+    monkeypatch.setattr(dynamic_query_service, "rename_conversation", fake_rename_history)
     app.dependency_overrides[get_db] = override_get_db
     try:
         client = TestClient(app)
@@ -294,6 +358,7 @@ def test_case_scoped_next_turn_checks_query_and_reuses_multipart_adapter(monkeyp
             headers=headers,
             files=[
                 ("variant_id", (None, str(variant_id))),
+                ("conversation_id", (None, str(conversation_id))),
                 ("latest_response", (None, "网页端混合答复")),
                 ("response_images", ("first.png", png_1, "image/png")),
                 ("response_images", ("second.png", png_2, "image/png")),
@@ -304,18 +369,59 @@ def test_case_scoped_next_turn_checks_query_and_reuses_multipart_adapter(monkeyp
         assert calls[-1]["actor_id"] == user.id
         assert calls[-1]["query_id"] == query_id
         assert calls[-1]["variant_id"] == variant_id
+        assert calls[-1]["conversation_id"] == conversation_id
         assert calls[-1]["latest_response"] == "网页端混合答复"
         assert [image.data for image in calls[-1]["response_images"]] == [png_1, png_2]
+
+        history_response = client.get(
+            f"/cases/{case_id}/queries/{query_id}/dynamic-conversations",
+            headers=headers,
+            params={"variant_id": str(variant_id)},
+        )
+        assert history_response.status_code == 200, history_response.text
+        assert history_response.json()[0]["conversation_id"] == str(conversation_id)
+        assert history_response.json()[0]["turns"][0]["messages"] == ["种子第一轮"]
+        assert history_response.json()[0]["turns"][0]["tested_response_raw_content"] == (
+            "截图中的被测系统原始回复"
+        )
+
+        start_response = client.post(
+            f"/cases/{case_id}/queries/{query_id}/dynamic-conversations",
+            headers=headers,
+            json={"variant_id": str(variant_id)},
+        )
+        assert start_response.status_code == 200, start_response.text
+        assert start_response.json()["status"] == "awaiting_response"
+
+        rename_response = client.patch(
+            f"/cases/{case_id}/queries/{query_id}/dynamic-conversations/{conversation_id}",
+            headers=headers,
+            json={"name": "首轮截图复测"},
+        )
+        assert rename_response.status_code == 200, rename_response.text
+        assert rename_response.json()["name"] == "首轮截图复测"
+        assert [name for name, _ in history_calls] == ["list", "start", "rename"]
+        assert all(call["actor_id"] == user.id for _, call in history_calls)
 
         # A query from another case is rejected before any service call.
         prior_call_count = len(calls)
         mismatch = client.post(
             f"/cases/{case_id}/queries/{uuid.uuid4()}/next-turn",
             headers=headers,
-            files=[("variant_id", (None, str(variant_id)))],
+            files=[
+                ("variant_id", (None, str(variant_id))),
+                ("conversation_id", (None, str(conversation_id))),
+            ],
         )
         assert mismatch.status_code == 404
         assert len(calls) == prior_call_count
+
+        missing_internal_conversation_id = client.post(
+            f"/cases/{case_id}/queries/{query_id}/next-turn",
+            headers=headers,
+            files=[("variant_id", (None, str(variant_id)))],
+        )
+        assert missing_internal_conversation_id.status_code == 422
 
         without_jwt = client.post(
             f"/cases/{case_id}/queries/{query_id}/next-turn",

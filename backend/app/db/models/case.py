@@ -21,7 +21,6 @@ from sqlalchemy import (
     Integer,
     UniqueConstraint,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -291,17 +290,8 @@ class DynamicConversation(Base):
 
     __tablename__ = "dynamic_conversations"
     __table_args__ = (
-        # Callers do not send a conversation id, so the database must prevent
-        # concurrent active histories from sharing the actor/query lookup key.
-        Index(
-            "uq_dynamic_conversations_active_actor_query",
-            "started_by",
-            "query_id",
-            unique=True,
-            postgresql_where=text(
-                "status IN ('awaiting_response', 'generating', 'generation_failed')"
-            ),
-        ),
+        # Multiple unfinished runs may share an account and query. Every later
+        # mutation is scoped by the durable conversation UUID instead.
         Index("ix_dynamic_conversations_query_id", "query_id"),
     )
 
@@ -311,6 +301,9 @@ class DynamicConversation(Base):
     started_by: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    # Optional account-owned label makes repeated runs distinguishable without
+    # changing the immutable query/persona identifiers captured by the run.
+    name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     status: Mapped[str] = mapped_column(String(24), default="awaiting_response")
     current_round: Mapped[int] = mapped_column(Integer, default=1)
     context_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict)

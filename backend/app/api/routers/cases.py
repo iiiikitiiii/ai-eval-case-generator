@@ -6,7 +6,12 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
-from app.api.dynamic_query_adapter import advance_next_turn_http
+from app.api.dynamic_query_adapter import (
+    advance_next_turn_http,
+    list_conversation_history_http,
+    rename_conversation_http,
+    start_new_conversation_http,
+)
 from app.api.deps import get_arq_pool, get_current_user, require_role
 from app.core.storage import get_object_bytes
 from app.db.models.user import User
@@ -34,10 +39,29 @@ from app.schemas.case import (
     RunAgentFIn,
     VariantSelectIn,
 )
-from app.schemas.dynamic_query import NextTurnOut
+from app.schemas.dynamic_query import (
+    DynamicConversationOut,
+    NextTurnOut,
+    RenameDynamicConversationIn,
+    StartDynamicConversationIn,
+)
 from app.services import case_service
 
 router = APIRouter(prefix="/cases", tags=["cases"])
+
+
+def _ensure_query_belongs_to_case(case, query_id: uuid.UUID) -> None:
+    """Keep case/query ownership checks identical for all web dynamic routes."""
+
+    if not any(
+        query.id == query_id
+        for cutpoint in case.cutpoints
+        for query in cutpoint.queries
+    ):
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "用例不存在或不属于该病例",
+        )
 
 
 def _to_list_item(case) -> CaseListItem:
@@ -229,11 +253,85 @@ def decide_query(
     return case_service.decide_query(db, case, query_id, body.decision, user, body.reason)
 
 
+@router.get(
+    "/{case_id}/queries/{query_id}/dynamic-conversations",
+    response_model=list[DynamicConversationOut],
+)
+def list_dynamic_conversations(
+    case_id: uuid.UUID,
+    query_id: uuid.UUID,
+    variant_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[DynamicConversationOut]:
+    """List the current account's prior tests for one query and persona."""
+
+    case = case_service.get_case_or_404(db, case_id)
+    _ensure_query_belongs_to_case(case, query_id)
+    return list_conversation_history_http(
+        db=db,
+        user=user,
+        query_id=query_id,
+        variant_id=variant_id,
+    )
+
+
+@router.post(
+    "/{case_id}/queries/{query_id}/dynamic-conversations",
+    response_model=DynamicConversationOut,
+)
+def start_dynamic_conversation(
+    case_id: uuid.UUID,
+    query_id: uuid.UUID,
+    body: StartDynamicConversationIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> DynamicConversationOut:
+    """Start a distinct test while retaining all earlier test histories."""
+
+    case = case_service.get_case_or_404(db, case_id)
+    _ensure_query_belongs_to_case(case, query_id)
+    return start_new_conversation_http(
+        db=db,
+        user=user,
+        query_id=query_id,
+        variant_id=body.variant_id,
+    )
+
+
+@router.patch(
+    "/{case_id}/queries/{query_id}/dynamic-conversations/{conversation_id}",
+    response_model=DynamicConversationOut,
+)
+def rename_dynamic_conversation(
+    case_id: uuid.UUID,
+    query_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    body: RenameDynamicConversationIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> DynamicConversationOut:
+    """Rename one account-owned dynamic test record."""
+
+    case = case_service.get_case_or_404(db, case_id)
+    _ensure_query_belongs_to_case(case, query_id)
+    return rename_conversation_http(
+        db=db,
+        user=user,
+        query_id=query_id,
+        conversation_id=conversation_id,
+        name=body.name,
+    )
+
+
 @router.post("/{case_id}/queries/{query_id}/next-turn", response_model=NextTurnOut)
 async def advance_dynamic_query(
     case_id: uuid.UUID,
     query_id: uuid.UUID,
     variant_id: uuid.UUID = Form(...),
+    # The web app creates runs through /dynamic-conversations, so every
+    # subsequent multipart request must identify the exact selected run.
+    conversation_id: uuid.UUID = Form(...),
     latest_response: str | None = Form(default=None, max_length=100_000),
     response_images: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
@@ -242,16 +340,7 @@ async def advance_dynamic_query(
     """Validate case ownership before delegating to the shared HTTP adapter."""
 
     case = case_service.get_case_or_404(db, case_id)
-    query_belongs_to_case = any(
-        query.id == query_id
-        for cutpoint in case.cutpoints
-        for query in cutpoint.queries
-    )
-    if not query_belongs_to_case:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            "用例不存在或不属于该病例",
-        )
+    _ensure_query_belongs_to_case(case, query_id)
     return await advance_next_turn_http(
         db=db,
         user=user,
@@ -259,6 +348,7 @@ async def advance_dynamic_query(
         variant_id=variant_id,
         latest_response=latest_response,
         response_images=response_images,
+        conversation_id=conversation_id,
     )
 
 

@@ -422,15 +422,15 @@ async def test_first_turn_reuses_seed_without_llm(db_session, monkeypatch):
     assert first_turn.question_goal == "验证系统能否区分检查异常与最终确诊"
     assert first_turn.expected_answer_points == query.expected_answer_points
 
-    # A repeated start retrieves the current unanswered turn instead of
-    # creating a second active conversation.
+    # Every ID-less empty request creates an independent active test.
     repeated = await dynamic_query_service.advance_next_turn(
         db_session, actor.id, query.id, variant.id, None
     )
-    assert repeated == result
+    assert repeated.conversation_id != result.conversation_id
+    assert repeated.messages == result.messages
     assert db_session.query(DynamicConversation).filter_by(
         started_by=actor.id, query_id=query.id
-    ).count() == 1
+    ).count() == 2
 
 
 @pytest.mark.anyio
@@ -469,6 +469,192 @@ async def test_seed_turn_goal_falls_back_and_answer_points_are_required(db_sessi
 
 
 @pytest.mark.anyio
+async def test_user_can_start_and_browse_multiple_tests_for_one_variant(db_session):
+    """New runs preserve earlier unfinished tests and remain independently addressable."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+
+    second = dynamic_query_service.start_new_conversation(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    )
+    assert second.conversation_id != first.conversation_id
+    assert second.status == "awaiting_response"
+    assert second.turns[0].messages == first.messages
+
+    histories = dynamic_query_service.list_conversation_history(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    )
+    assert {item.conversation_id for item in histories} == {
+        first.conversation_id,
+        second.conversation_id,
+    }
+    prior = next(item for item in histories if item.conversation_id == first.conversation_id)
+    assert prior.status == "awaiting_response"
+    assert prior.stop_reason is None
+    assert prior.finished_at is None
+
+    other_actor = User(
+        id=uuid.uuid4(),
+        email=f"history-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash="not-used",
+        name="其他账号",
+        role="engineer",
+        is_active=True,
+    )
+    db_session.add(other_actor)
+    db_session.commit()
+    assert dynamic_query_service.list_conversation_history(
+        db_session,
+        actor_id=other_actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    ) == []
+
+    renamed = dynamic_query_service.rename_conversation(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        conversation_id=second.conversation_id,
+        name="  病理边界复测  ",
+    )
+    assert renamed.name == "病理边界复测"
+    renamed_histories = dynamic_query_service.list_conversation_history(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    )
+    assert next(
+        item for item in renamed_histories if item.conversation_id == second.conversation_id
+    ).name == "病理边界复测"
+    with pytest.raises(dynamic_query_service.DynamicQueryNotFound):
+        dynamic_query_service.rename_conversation(
+            db_session,
+            actor_id=other_actor.id,
+            query_id=query.id,
+            conversation_id=second.conversation_id,
+            name="不能修改别人的记录",
+        )
+
+    # A generating sibling does not prevent another independent test start.
+    generating = db_session.get(DynamicConversation, second.conversation_id)
+    assert generating is not None
+    generating.status = "generating"
+    db_session.commit()
+    third = dynamic_query_service.start_new_conversation(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    )
+    assert third.conversation_id not in {first.conversation_id, second.conversation_id}
+    assert db_session.get(DynamicConversation, first.conversation_id).status == "awaiting_response"
+    assert db_session.get(DynamicConversation, second.conversation_id).status == "generating"
+
+
+@pytest.mark.anyio
+async def test_multiple_active_tests_advance_only_by_conversation_id(db_session, monkeypatch):
+    """Concurrent active runs keep answers and generated turns fully isolated."""
+
+    actor, query, variant = _seed_dynamic_case(db_session)
+    first = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    second = await dynamic_query_service.advance_next_turn(
+        db_session, actor.id, query.id, variant.id, None
+    )
+    generated = iter(["第二次测试的追问", "第一次测试的追问"])
+
+    async def fake_llm(**kwargs):
+        return {
+            "done": False,
+            "messages": [next(generated)],
+            "stop_reason": None,
+            "question_goal": "验证会话 ID 精确隔离",
+            "expected_answer_points": ["仅使用当前测试的真实答复"],
+            "raw_content": None,
+        }
+
+    monkeypatch.setattr(dynamic_query_service, "run_structured", fake_llm)
+    second_result = await dynamic_query_service.advance_next_turn(
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "第二次测试答复",
+        conversation_id=second.conversation_id,
+    )
+    first_result = await dynamic_query_service.advance_next_turn(
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "第一次测试答复",
+        conversation_id=first.conversation_id,
+    )
+
+    assert second_result.messages == ["第二次测试的追问"]
+    assert first_result.messages == ["第一次测试的追问"]
+    first_turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=first.conversation_id,
+        round=1,
+    ).one()
+    second_turn = db_session.query(DynamicConversationTurn).filter_by(
+        conversation_id=second.conversation_id,
+        round=1,
+    ).one()
+    assert first_turn.tested_response == "第一次测试答复"
+    assert second_turn.tested_response == "第二次测试答复"
+
+    other_actor = User(
+        id=uuid.uuid4(),
+        email=f"isolation-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash="not-used",
+        name="隔离测试账号",
+        role="engineer",
+        is_active=True,
+    )
+    db_session.add(other_actor)
+    db_session.commit()
+    with pytest.raises(dynamic_query_service.DynamicQueryNotFound):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            other_actor.id,
+            query.id,
+            variant.id,
+            "越权答复",
+            conversation_id=first.conversation_id,
+        )
+    with pytest.raises(dynamic_query_service.DynamicQueryNotFound):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            uuid.uuid4(),
+            variant.id,
+            "错误用例答复",
+            conversation_id=first.conversation_id,
+        )
+    with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="画像不一致"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            uuid.uuid4(),
+            "错误画像答复",
+            conversation_id=first.conversation_id,
+        )
+
+
+@pytest.mark.anyio
 async def test_real_response_generates_and_persists_r2(db_session, monkeypatch):
     actor, query, variant = _seed_dynamic_case(db_session)
     first = await dynamic_query_service.advance_next_turn(
@@ -501,6 +687,7 @@ async def test_real_response_generates_and_persists_r2(db_session, monkeypatch):
         query.id,
         variant.id,
         "系统回复：现在还不能确诊，需要等待病理。",
+        conversation_id=first.conversation_id,
     )
 
     assert result.round == 2
@@ -564,6 +751,7 @@ async def test_existing_legacy_snapshot_continues_without_rebuild(db_session, mo
         query.id,
         variant.id,
         "旧会话的真实答复",
+        conversation_id=first.conversation_id,
     )
 
     assert result.round == 2
@@ -607,6 +795,7 @@ async def test_image_only_and_combined_responses_send_only_current_images(
         variant.id,
         None,
         [_reply_image()],
+        conversation_id=first.conversation_id,
     )
     assert second.round == 2
     assert calls[0]["images"] == [(PNG_REPLY, "image/png")]
@@ -620,6 +809,13 @@ async def test_image_only_and_combined_responses_send_only_current_images(
     assert first_turn.answered_at is not None
     assert first_turn.tested_response_raw_content == "截图原文 1"
     assert len(first_turn.tested_response_images) == 1
+    history = dynamic_query_service.list_conversation_history(
+        db_session,
+        actor_id=actor.id,
+        query_id=query.id,
+        variant_id=variant.id,
+    )
+    assert history[0].turns[0].tested_response_raw_content == "截图原文 1"
     stored = first_turn.tested_response_images[0]
     assert stored["object_key"] in objects
     assert stored["size"] == len(PNG_REPLY)
@@ -633,6 +829,7 @@ async def test_image_only_and_combined_responses_send_only_current_images(
         variant.id,
         "这次同时提供文字和截图。",
         [_reply_image(PNG_REPLY_2)],
+        conversation_id=first.conversation_id,
     )
     assert third.round == 3
     assert calls[1]["images"] == [(PNG_REPLY_2, "image/png")]
@@ -674,6 +871,7 @@ async def test_image_generation_failure_reuses_objects_and_requires_same_order(
             variant.id,
             "包含两张截图。",
             original_images,
+            conversation_id=first.conversation_id,
         )
     assert len(writes) == 2
 
@@ -685,6 +883,7 @@ async def test_image_generation_failure_reuses_objects_and_requires_same_order(
             variant.id,
             "包含两张截图。",
             list(reversed(original_images)),
+            conversation_id=first.conversation_id,
         )
 
     async def recover_llm(**kwargs):
@@ -703,8 +902,8 @@ async def test_image_generation_failure_reuses_objects_and_requires_same_order(
         actor.id,
         query.id,
         variant.id,
-        "包含两张截图。",
-        original_images,
+        None,
+        conversation_id=first.conversation_id,
     )
     assert recovered.round == 2
     assert len(writes) == 2
@@ -754,6 +953,7 @@ async def test_partial_image_upload_is_cleaned_and_answer_remains_open(
             variant.id,
             "上传中断",
             [_reply_image(PNG_REPLY), _reply_image(PNG_REPLY_2)],
+            conversation_id=first.conversation_id,
         )
 
     db_session.expire_all()
@@ -796,6 +996,7 @@ async def test_database_failure_after_image_upload_cleans_objects(
             variant.id,
             "数据库写入失败",
             [_reply_image()],
+            conversation_id=first.conversation_id,
         )
     monkeypatch.setattr(db_session, "commit", original_commit)
 
@@ -831,13 +1032,27 @@ async def test_model_can_finish_early(db_session, monkeypatch):
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", fake_llm)
     result = await dynamic_query_service.advance_next_turn(
-        db_session, actor.id, query.id, variant.id, "解释已经很清楚。"
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        "解释已经很清楚。",
+        conversation_id=first.conversation_id,
     )
 
     assert result.done is True
     assert result.stop_reason == "目标已充分覆盖"
     conversation = db_session.get(DynamicConversation, first.conversation_id)
     assert conversation.status == "completed"
+    with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="已经结束"):
+        await dynamic_query_service.advance_next_turn(
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "结束后不能继续",
+            conversation_id=first.conversation_id,
+        )
 
 
 @pytest.mark.anyio
@@ -853,7 +1068,12 @@ async def test_generation_failure_preserves_response_and_allows_same_retry(db_se
     monkeypatch.setattr(dynamic_query_service, "run_structured", fail_llm)
     with pytest.raises(dynamic_query_service.DynamicQueryGenerationFailed):
         await dynamic_query_service.advance_next_turn(
-            db_session, actor.id, query.id, variant.id, "需要等待最终病理。"
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "需要等待最终病理。",
+            conversation_id=first.conversation_id,
         )
 
     conversation = db_session.get(DynamicConversation, first.conversation_id)
@@ -865,7 +1085,12 @@ async def test_generation_failure_preserves_response_and_allows_same_retry(db_se
 
     with pytest.raises(dynamic_query_service.DynamicQueryConflict):
         await dynamic_query_service.advance_next_turn(
-            db_session, actor.id, query.id, variant.id, "换一个答复覆盖原记录。"
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "换一个答复覆盖原记录。",
+            conversation_id=first.conversation_id,
         )
 
     async def recover_llm(**kwargs):
@@ -880,7 +1105,12 @@ async def test_generation_failure_preserves_response_and_allows_same_retry(db_se
 
     monkeypatch.setattr(dynamic_query_service, "run_structured", recover_llm)
     recovered = await dynamic_query_service.advance_next_turn(
-        db_session, actor.id, query.id, variant.id, "需要等待最终病理。"
+        db_session,
+        actor.id,
+        query.id,
+        variant.id,
+        None,
+        conversation_id=first.conversation_id,
     )
     assert recovered.round == 2
     assert recovered.messages == ["那最终病理大概什么时候出？"]
@@ -919,6 +1149,7 @@ async def test_round_four_response_stops_without_llm(db_session, monkeypatch):
         variant.id,
         "第四轮答复",
         [_reply_image()],
+        conversation_id=first.conversation_id,
     )
     assert result.done is True
     assert result.round == 4
@@ -948,7 +1179,7 @@ async def test_rejects_variant_outside_query_first_call_images_and_blank_respons
         raise AssertionError("A first call must not accept reply images")
 
     monkeypatch.setattr(dynamic_query_service, "put_object", should_not_store)
-    with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="先获取第一轮"):
+    with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput, match="conversation_id"):
         await dynamic_query_service.advance_next_turn(
             db_session,
             actor.id,
@@ -958,12 +1189,17 @@ async def test_rejects_variant_outside_query_first_call_images_and_blank_respons
             [_reply_image()],
         )
 
-    await dynamic_query_service.advance_next_turn(
+    created = await dynamic_query_service.advance_next_turn(
         db_session, actor.id, query.id, variant.id, None
     )
     with pytest.raises(dynamic_query_service.DynamicQueryInvalidInput):
         await dynamic_query_service.advance_next_turn(
-            db_session, actor.id, query.id, variant.id, "   "
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "   ",
+            conversation_id=created.conversation_id,
         )
 
 
@@ -979,7 +1215,12 @@ async def test_generating_state_rejects_concurrent_advance(db_session):
 
     with pytest.raises(dynamic_query_service.DynamicQueryConflict, match="正在生成"):
         await dynamic_query_service.advance_next_turn(
-            db_session, actor.id, query.id, variant.id, "并发提交"
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "并发提交",
+            conversation_id=first.conversation_id,
         )
 
 
@@ -1005,7 +1246,12 @@ async def test_timeout_preserves_retryable_failed_state(db_session, monkeypatch)
     monkeypatch.setattr(dynamic_query_service, "DYNAMIC_QUERY_TIMEOUT_SECONDS", 0.001)
     with pytest.raises(dynamic_query_service.DynamicQueryGenerationTimeout):
         await dynamic_query_service.advance_next_turn(
-            db_session, actor.id, query.id, variant.id, "等待超时"
+            db_session,
+            actor.id,
+            query.id,
+            variant.id,
+            "等待超时",
+            conversation_id=first.conversation_id,
         )
 
     conversation = db_session.get(DynamicConversation, first.conversation_id)

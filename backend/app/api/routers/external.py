@@ -29,6 +29,7 @@ router = APIRouter(prefix="/external", tags=["external"])
             Content-Type: multipart/form-data
    首轮字段: variant_id=<uuid>
    后续字段: variant_id=<同一画像 uuid>
+             conversation_id=<首轮响应中的 uuid>
              latest_response=<可选的被测系统文字答复>
              response_images=@reply-1.png（可重复，最多 10 张）
    此接口不再接受 application/json。
@@ -38,8 +39,9 @@ router = APIRouter(prefix="/external", tags=["external"])
      "messages": ["本轮应发送的消息"], "images": [1, 2],
      "done": false, "stop_reason": null
    }
-会话与轮次由服务端持久化，调用方无需保存或传回 conversation_id；路由只
-处理 JWT、请求校验和领域异常到 HTTP 状态码的转换。
+会话与轮次由服务端持久化。省略 conversation_id 的空答复请求会新建测试；
+调用方必须保存响应 ID，并在后续轮次传回。路由只处理 JWT、请求校验和
+领域异常到 HTTP 状态码的转换。
 """
 
 
@@ -50,6 +52,7 @@ router = APIRouter(prefix="/external", tags=["external"])
 async def next_turn_entry(
     query_id: uuid.UUID,
     variant_id: uuid.UUID = Form(...),
+    conversation_id: uuid.UUID | None = Form(default=None),
     latest_response: str | None = Form(default=None, max_length=100_000),
     response_images: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
@@ -64,4 +67,5 @@ async def next_turn_entry(
         variant_id=variant_id,
         latest_response=latest_response,
         response_images=response_images,
+        conversation_id=conversation_id,
     )
